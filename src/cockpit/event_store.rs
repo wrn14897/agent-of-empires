@@ -53,7 +53,7 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use tracing::{debug, trace, warn};
 
-use super::state::Event;
+use super::state::{Event, Plan};
 
 /// SQLite-backed cockpit event log. One row per (session_id, seq).
 pub struct EventStore {
@@ -109,7 +109,7 @@ impl EventStore {
     }
 
     /// Append one event. Idempotent on duplicate (session_id, seq) thanks
-    /// to the primary key — re-publishing the same seq is a no-op.
+    /// to the primary key; re-publishing the same seq is a no-op.
     /// Returns Err when the event was *not* persisted, so the caller can
     /// surface the gap (e.g. publish a `Lagged` frame on the broadcast
     /// channel) instead of letting the on-disk log silently fall behind
@@ -136,7 +136,7 @@ impl EventStore {
             // Logged at trace because the cause is usually a benign retry
             // (publish_user_prompt + replay drain re-publishing) rather
             // than a bug, but we still want a breadcrumb. Per-event lines
-            // are too noisy to live at debug — they bury the lifecycle
+            // are too noisy to live at debug; they bury the lifecycle
             // signal in debug.log during an active turn.
             trace!(
                 target: "cockpit.event_store",
@@ -159,6 +159,14 @@ impl EventStore {
         // (the subquery returns 0 rows). We do it on every insert rather
         // than periodically so the upper bound on per-session disk usage
         // is strict rather than amortised.
+        //
+        // Snapshot events (the slash-command list, mode list, ACP session
+        // id) are exempt from pruning: the agent only emits them once per
+        // session lifecycle, near the start of the seq range, so a long
+        // session blows past the cap and evicts them; leaving the
+        // composer's `/` palette and the mode picker empty on reconnect.
+        // See #1049. The `event_json NOT LIKE` clauses match the
+        // externally-tagged JSON discriminant for each pinned variant.
         if self.max_events_per_session > 0 {
             match conn.execute(
                 "DELETE FROM cockpit_events
@@ -168,7 +176,11 @@ impl EventStore {
                      WHERE session_id = ?1
                      ORDER BY seq DESC
                      LIMIT 1 OFFSET ?2
-                   )",
+                   )
+                   AND event_json NOT LIKE '{\"AvailableCommandsUpdated\":%'
+                   AND event_json NOT LIKE '{\"ModesAvailable\":%'
+                   AND event_json NOT LIKE '{\"CurrentModeChanged\":%'
+                   AND event_json NOT LIKE '{\"AcpSessionAssigned\":%'",
                 params![session_id, self.max_events_per_session as i64],
             ) {
                 Ok(0) => {}
@@ -182,7 +194,7 @@ impl EventStore {
                     );
                 }
                 Err(e) => {
-                    // Prune failure isn't fatal — the row is recorded,
+                    // Prune failure isn't fatal; the row is recorded,
                     // we just exceed the cap until the next prune
                     // succeeds. Log + swallow so callers don't have to
                     // distinguish "record failed" from "trim failed".
@@ -243,6 +255,36 @@ impl EventStore {
             "replayed events"
         );
         out
+    }
+
+    /// Return the latest `Event::PlanUpdated` stored for `session_id`,
+    /// if any. Used by the REST sessions endpoint to surface
+    /// plan-progress chrome (current step / completed / total) on the
+    /// sidebar without subscribing to the cockpit WS for every session.
+    /// See #1061.
+    pub fn latest_plan(&self, session_id: &str) -> Option<Plan> {
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let json: String = conn
+            .query_row(
+                "SELECT event_json FROM cockpit_events
+                 WHERE session_id = ?1
+                   AND event_json LIKE '{\"PlanUpdated\":%'
+                 ORDER BY seq DESC LIMIT 1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()?;
+        let event: Event = serde_json::from_str(&json).ok()?;
+        if let Event::PlanUpdated { plan } = event {
+            Some(plan)
+        } else {
+            None
+        }
     }
 
     /// Return the highest seq stored for `session_id`, or 0 if none.
@@ -473,6 +515,160 @@ mod tests {
             assert_eq!(text, "hi");
         } else {
             panic!("expected UserPromptSent");
+        }
+    }
+
+    #[test]
+    fn latest_plan_returns_most_recent_plan_event() {
+        use super::super::state::{Plan, PlanStep, PlanStepStatus};
+        let (_tmp, store) = open_store(1000);
+        let plan_v1 = Plan {
+            plan_id: "p-1".into(),
+            version: 1,
+            steps: vec![PlanStep {
+                id: "s-1".into(),
+                title: "Step one".into(),
+                detail: None,
+                status: PlanStepStatus::Pending,
+            }],
+        };
+        let plan_v2 = Plan {
+            plan_id: "p-2".into(),
+            version: 2,
+            steps: vec![
+                PlanStep {
+                    id: "s-1".into(),
+                    title: "Step one".into(),
+                    detail: None,
+                    status: PlanStepStatus::Done,
+                },
+                PlanStep {
+                    id: "s-2".into(),
+                    title: "Step two".into(),
+                    detail: None,
+                    status: PlanStepStatus::Pending,
+                },
+            ],
+        };
+        store
+            .record("s-1", 1, &Event::PlanUpdated { plan: plan_v1 })
+            .unwrap();
+        store.record("s-1", 2, &Event::ThinkingStarted).unwrap();
+        store
+            .record("s-1", 3, &Event::PlanUpdated { plan: plan_v2 })
+            .unwrap();
+        let latest = store.latest_plan("s-1").expect("plan present");
+        assert_eq!(latest.steps.len(), 2);
+        assert!(matches!(
+            latest.steps[0].status,
+            crate::cockpit::state::PlanStepStatus::Done
+        ));
+    }
+
+    #[test]
+    fn latest_plan_returns_none_when_no_plan_event() {
+        let (_tmp, store) = open_store(1000);
+        store.record("s-1", 1, &Event::ThinkingStarted).unwrap();
+        assert!(store.latest_plan("s-1").is_none());
+    }
+
+    #[test]
+    fn snapshot_events_survive_retention_prune() {
+        // Mirrors #1049: a long session blew past max_events_per_session
+        // and evicted the early `AvailableCommandsUpdated` row, leaving
+        // the `/` palette empty on reconnect. Snapshot kinds are pinned
+        // so they outlive the prune even when the rest of the seq tail
+        // gets dropped.
+        let (_tmp, store) = open_store(3);
+        store
+            .record(
+                "s-1",
+                1,
+                &Event::AvailableCommandsUpdated { commands: vec![] },
+            )
+            .unwrap();
+        store
+            .record(
+                "s-1",
+                2,
+                &Event::ModesAvailable {
+                    current_mode_id: "default".into(),
+                    modes: vec![],
+                },
+            )
+            .unwrap();
+        store
+            .record(
+                "s-1",
+                3,
+                &Event::AcpSessionAssigned {
+                    acp_session_id: "acp-xyz".into(),
+                },
+            )
+            .unwrap();
+        // Push enough transcript events to blow past the cap several
+        // times. With the old prune, seqs 1-3 would all be evicted.
+        for i in 4..=20 {
+            store.record("s-1", i, &Event::ThinkingStarted).unwrap();
+        }
+        let replay = store.replay_from("s-1", 0);
+        let seqs: Vec<u64> = replay.iter().map(|(s, _)| *s).collect();
+        // The three snapshot rows survive. The most recent 3 transcript
+        // events also remain.
+        assert!(
+            seqs.contains(&1),
+            "AvailableCommandsUpdated dropped: {seqs:?}"
+        );
+        assert!(seqs.contains(&2), "ModesAvailable dropped: {seqs:?}");
+        assert!(seqs.contains(&3), "AcpSessionAssigned dropped: {seqs:?}");
+        assert!(seqs.contains(&20), "newest event dropped: {seqs:?}");
+        // Older transcript-only events (4 through 17) are pruned.
+        assert!(
+            !seqs.contains(&5),
+            "stale transcript event leaked: {seqs:?}"
+        );
+    }
+
+    #[test]
+    fn snapshot_event_json_discriminators_match_prune_clauses() {
+        // The retention prune query in `Self::record` excludes four event
+        // variants via `WHERE event_json NOT LIKE '{"<Variant>":%'`. If the
+        // `Event` enum is ever refactored to a different serde shape
+        // (`#[serde(tag = "...")]`, a rename, or another adjacency), the
+        // LIKE strings silently stop matching and snapshot pinning quietly
+        // breaks. Pin the discriminator at the JSON level so any such
+        // refactor trips this test instead of going unnoticed.
+        let cases: &[(Event, &str)] = &[
+            (
+                Event::AvailableCommandsUpdated { commands: vec![] },
+                "{\"AvailableCommandsUpdated\":",
+            ),
+            (
+                Event::ModesAvailable {
+                    current_mode_id: "default".into(),
+                    modes: vec![],
+                },
+                "{\"ModesAvailable\":",
+            ),
+            (
+                Event::CurrentModeChanged {
+                    current_mode_id: "default".into(),
+                },
+                "{\"CurrentModeChanged\":",
+            ),
+            (
+                Event::AcpSessionAssigned {
+                    acp_session_id: "acp-xyz".into(),
+                },
+                "{\"AcpSessionAssigned\":",
+            ),
+        ];
+        for (event, expected_prefix) in cases {
+            let json = serde_json::to_string(event).unwrap();
+            assert!(
+                json.starts_with(expected_prefix),
+                "snapshot variant serialised as {json}, expected to start with {expected_prefix}"
+            );
         }
     }
 

@@ -133,6 +133,11 @@ enum ConnectMode {
 /// bounded.
 const RESUME_IDLE_GRACE_DEFAULT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Monotonic counter appended to synthetic tool-call IDs so two events
+/// minted within the same millisecond don't collide on the
+/// `(session_id, tool_id)` keys used by the cockpit event store.
+static SYNTHETIC_TOOL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Read the resume-idle grace. In debug builds, honors
 /// `AOE_RESUME_IDLE_GRACE_MS` so integration tests can short-circuit
 /// the default 10s without making real failures racy. Values below
@@ -333,7 +338,7 @@ impl AcpClient {
     /// post-spawn "wait for runner to bind, then dial" path AND by the
     /// `Self::attach` reattach path on `aoe serve` startup. The runner
     /// owns the agent subprocess so this constructor returns an
-    /// `AcpClient` with `_child = None` — dropping the client does not
+    /// `AcpClient` with `_child = None`; dropping the client does not
     /// terminate the worker.
     #[allow(clippy::too_many_arguments)]
     async fn connect_via_socket(
@@ -397,7 +402,7 @@ impl AcpClient {
 
     /// Reattach to an already-running cockpit worker over its unix
     /// socket. Used by `aoe serve` startup when a registry entry has a
-    /// live PID and an existing socket file — we connect, send only the
+    /// live PID and an existing socket file; we connect, send only the
     /// (idempotent) ACP `initialize` request, and reuse the existing
     /// `stored_acp_session_id` directly. We deliberately do NOT issue
     /// `session/new` or `session/load`: the agent process is still
@@ -527,7 +532,7 @@ impl AcpClient {
 }
 
 /// Reject `provider_env` request entries whose key would either escape
-/// the agent sandbox (PATH, HOME, etc. — `always_forward` already wires
+/// the agent sandbox (PATH, HOME, etc.; `always_forward` already wires
 /// those from the operator's environment) or hijack the dynamic linker
 /// (LD_PRELOAD, DYLD_INSERT_LIBRARIES, etc.) to run arbitrary code in
 /// the child. Provider auth keys (`ANTHROPIC_API_KEY`, etc.) are
@@ -561,12 +566,12 @@ fn provider_env_denyreason(key: &str) -> Option<&'static str> {
 }
 
 /// Scrub well-known secret patterns from agent stderr before it lands in
-/// `debug.log`. Conservative — only redacts strings that unambiguously
+/// `debug.log`. Conservative; only redacts strings that unambiguously
 /// signal a secret via prefix (Anthropic `sk-`, GitHub `ghp_`,
 /// `Bearer <token>`, etc.). Catches the common case where an adapter
 /// prints "auth failed: api_key=sk-ant-..."; will not catch a hand-rolled
 /// secret with no recognisable shape. Users sharing logs in bug reports
-/// should still scan them — see docs/cockpit.md#sharing-debug-logs.
+/// should still scan them; see docs/cockpit.md#sharing-debug-logs.
 fn scrub_stderr_secrets(line: &str) -> std::borrow::Cow<'_, str> {
     use std::sync::OnceLock;
     static RE: OnceLock<regex::Regex> = OnceLock::new();
@@ -579,9 +584,98 @@ fn scrub_stderr_secrets(line: &str) -> std::borrow::Cow<'_, str> {
     re.replace_all(line, "<redacted-secret>")
 }
 
+/// Resolve a bare agent command name to an absolute path, scanning common
+/// node-version-manager bin dirs (nvm, fnm, mise, asdf, Volta) plus the
+/// usual system locations. Returns the absolute binary path and the bin
+/// dir we found it in; the caller prepends that dir to the agent's PATH
+/// so the adapter's own subprocesses (`node`, `npx`) can still resolve.
+///
+/// Re-runs per spawn (no cache) so an `nvm use <other-version>` after the
+/// daemon started picks up immediately without a daemon restart. Returns
+/// None when the command is already a path, contains a `${placeholder}`,
+/// or isn't found anywhere we know to look.
+pub fn resolve_agent_command(command: &str) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    if command.contains('/') || command.contains('\\') || command.contains("${") {
+        return None;
+    }
+
+    if let Some(path) = find_in_path_env(command) {
+        let parent = path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(std::path::PathBuf::new);
+        return Some((path, parent));
+    }
+
+    for dir in node_search_dirs() {
+        let candidate = dir.join(command);
+        if candidate.is_file() {
+            return Some((candidate, dir));
+        }
+    }
+    None
+}
+
+fn find_in_path_env(binary: &str) -> Option<std::path::PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(binary);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Best-effort enumeration of node bin dirs the user is likely to have
+/// the adapter installed into. Order matters only for tie-breaking; the
+/// first hit wins, but in practice each binary only lives in one place.
+fn node_search_dirs() -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        // nvm: `~/.nvm/versions/node/v<ver>/bin/<binary>`
+        push_subdirs(&mut out, &home.join(".nvm/versions/node"), "bin");
+        // fnm: `~/.fnm/node-versions/v<ver>/installation/bin/<binary>`
+        push_subdirs(
+            &mut out,
+            &home.join(".fnm/node-versions"),
+            "installation/bin",
+        );
+        // mise: `~/.local/share/mise/installs/node/<ver>/bin/<binary>`
+        push_subdirs(
+            &mut out,
+            &home.join(".local/share/mise/installs/node"),
+            "bin",
+        );
+        // asdf: `~/.asdf/installs/nodejs/<ver>/bin/<binary>`
+        push_subdirs(&mut out, &home.join(".asdf/installs/nodejs"), "bin");
+        // Volta + user-scoped npm prefixes
+        out.push(home.join(".volta/bin"));
+        out.push(home.join(".npm-global/bin"));
+        out.push(home.join(".local/bin"));
+        out.push(home.join("bin"));
+    }
+    out.push(std::path::PathBuf::from("/usr/local/bin"));
+    out.push(std::path::PathBuf::from("/opt/homebrew/bin"));
+    out.push(std::path::PathBuf::from("/usr/bin"));
+    out
+}
+
+fn push_subdirs(out: &mut Vec<std::path::PathBuf>, root: &std::path::Path, leaf: &str) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let bin = entry.path().join(leaf);
+        if bin.is_dir() {
+            out.push(bin);
+        }
+    }
+}
+
 /// Spawn the `aoe __cockpit-runner` shim as a detached process. The
 /// runner owns the agent subprocess and outlives the daemon. We retain
-/// no `Child` handle here — once the runner is up, the daemon talks to
+/// no `Child` handle here; once the runner is up, the daemon talks to
 /// it over the unix socket and the OS keeps the runner alive across
 /// `aoe serve` restarts.
 fn spawn_runner_detached(
@@ -597,6 +691,17 @@ fn spawn_runner_detached(
     if let Some(parent) = log_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+
+    // Resolve the agent binary against PATH + known node-manager dirs so
+    // the runner spawns the right binary even when the daemon's frozen
+    // PATH doesn't contain it. See #1048. The resolved bin dir is also
+    // prepended to PATH below so the adapter's own `node`/`npx`
+    // subprocesses land in the same install.
+    let resolved = resolve_agent_command(&config.spec.command);
+    let (spawn_command, extra_path_dir) = match &resolved {
+        Some((abs, dir)) => (abs.to_string_lossy().into_owned(), Some(dir.clone())),
+        None => (config.spec.command.clone(), None),
+    };
 
     let mut cmd = StdCommand::new(&current_exe);
     cmd.arg("__cockpit-runner")
@@ -630,7 +735,10 @@ fn spawn_runner_detached(
         cmd.arg("--stored-acp-session-id").arg(stored);
     }
     cmd.arg("--");
-    cmd.arg(&config.spec.command);
+    // Pass the resolved absolute path (or fall back to the bare command).
+    // The runner spawns whatever it receives, so an absolute path bypasses
+    // any PATH lookup inside the runner.
+    cmd.arg(&spawn_command);
     for a in &config.spec.args {
         cmd.arg(a);
     }
@@ -642,6 +750,17 @@ fn spawn_runner_detached(
     // either process.
     cmd.env_clear();
     apply_env_filter(&mut cmd, config);
+    if let Some(extra) = &extra_path_dir {
+        // Prepend the resolved bin dir to the PATH we just forwarded so
+        // the adapter's own `node`/`npx` lookups land in the same install
+        // as the adapter itself, not whatever node happens to be on the
+        // daemon's frozen PATH.
+        let current = std::env::var("PATH").unwrap_or_default();
+        let extra_s = extra.to_string_lossy();
+        if !std::env::split_paths(&current).any(|p| p == *extra) {
+            cmd.env("PATH", format!("{}:{}", extra_s, current));
+        }
+    }
 
     // Detach: child becomes its own session leader so a SIGTERM/SIGHUP
     // to the aoe daemon's group doesn't cascade. The runner installs its
@@ -671,6 +790,7 @@ fn spawn_runner_detached(
         socket = %socket_path.display(),
         runner = %current_exe.display(),
         agent = %config.spec.command,
+        resolved = %spawn_command,
         "spawning detached cockpit runner"
     );
 
@@ -759,7 +879,17 @@ async fn wait_for_socket(
 }
 
 fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpError> {
-    let mut cmd = tokio::process::Command::new(&config.spec.command);
+    // Resolve bare command names against PATH + known node-manager dirs.
+    // `aoe serve` captures PATH at daemon-launch time and freezes it for
+    // its lifetime; without this, a `nvm use` after launch leaves the
+    // adapter installed but unreachable. See #1048.
+    let resolved = resolve_agent_command(&config.spec.command);
+    let (spawn_command, extra_path_dir) = match &resolved {
+        Some((abs, dir)) => (abs.to_string_lossy().into_owned(), Some(dir.clone())),
+        None => (config.spec.command.clone(), None),
+    };
+
+    let mut cmd = tokio::process::Command::new(&spawn_command);
     cmd.args(&config.spec.args)
         .current_dir(&config.cwd)
         .stdin(Stdio::piped())
@@ -787,7 +917,19 @@ fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpEr
     ];
     let mut forwarded_keys: Vec<&str> = Vec::new();
     for name in always_forward {
-        if let Ok(value) = std::env::var(name) {
+        if let Ok(mut value) = std::env::var(name) {
+            // Prepend the resolved bin dir to PATH so the adapter's own
+            // `node`/`npx` lookups land in the same node install as the
+            // adapter itself, not whatever node happens to be on the
+            // daemon's frozen PATH.
+            if name == "PATH" {
+                if let Some(extra) = &extra_path_dir {
+                    let extra_s = extra.to_string_lossy();
+                    if !std::env::split_paths(&value).any(|p| p == *extra) {
+                        value = format!("{}:{}", extra_s, value);
+                    }
+                }
+            }
             cmd.env(name, value);
             forwarded_keys.push(name);
         }
@@ -829,6 +971,7 @@ fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpEr
     info!(
         target: "cockpit.acp.spawn",
         command = %config.spec.command,
+        resolved = %spawn_command,
         args = ?config.spec.args,
         cwd = %config.cwd.display(),
         transport = if config.socket_path.is_some() { "socket" } else { "stdio" },
@@ -842,9 +985,24 @@ fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpEr
         warn!(
             target: "cockpit.acp.spawn",
             command = %config.spec.command,
+            resolved = %spawn_command,
             "spawn failed: {e}"
         );
-        AcpError::Spawn(e.to_string())
+        // ENOENT on a bare command means we couldn't find the binary on
+        // PATH or in any known node-manager dir. Bubble up a hint instead
+        // of the bare libc message; the daemon's frozen PATH is the
+        // most common cause and the generic message doesn't say so.
+        if e.kind() == std::io::ErrorKind::NotFound && resolved.is_none() {
+            AcpError::Spawn(format!(
+                "{} (binary `{}` not found on the daemon's PATH or in any \
+                 known node-manager bin dir; install it where the daemon \
+                 can see it, or restart `aoe serve` from a shell where \
+                 `which {}` resolves)",
+                e, config.spec.command, config.spec.command
+            ))
+        } else {
+            AcpError::Spawn(e.to_string())
+        }
     })?;
 
     let pid = child.id();
@@ -988,13 +1146,137 @@ fn transcript_event_kind(event: &Event) -> &'static str {
     }
 }
 
+/// Parse Claude's ExitPlanMode tool input into a structured `Plan`.
+/// Claude ships the plan markdown in `raw_input.plan`; we extract its
+/// bullet- or number-prefixed lines as `PlanStep`s with status=Pending,
+/// matching the ACP `SessionUpdate::Plan` shape so the existing
+/// PlanStrip renderer can consume it.
+///
+/// Returns `None` when the input has no `plan` key, the value isn't a
+/// string, or the string has no recognisable list items; in which case
+/// the generic tool card is still rendered so the user sees the raw
+/// plan text. See #1059 for the upstream gap this works around.
+fn extract_plan_from_switch_mode(raw_input: &serde_json::Value) -> Option<Plan> {
+    let plan_text = raw_input.get("plan")?.as_str()?;
+    let steps = parse_plan_steps(plan_text);
+    if steps.is_empty() {
+        return None;
+    }
+    Some(Plan {
+        plan_id: format!("plan-{}", chrono::Utc::now().timestamp_millis()),
+        version: 1,
+        steps,
+    })
+}
+
+/// Flatten plan markdown into `PlanStep`s. v1 heuristic: every line
+/// starting with `-`, `*`, or `<digit>.` becomes one step. Sub-bullets
+/// flatten into the parent list (PlanEntry has no nesting field in the
+/// ACP spec). Strips bold/italic markers from the step title so the
+/// PlanStrip doesn't render literal `**foo**`.
+fn parse_plan_steps(text: &str) -> Vec<PlanStep> {
+    use std::sync::OnceLock;
+    static BULLET: OnceLock<regex::Regex> = OnceLock::new();
+    let bullet = BULLET.get_or_init(|| {
+        regex::Regex::new(r"^\s*(?:[-*]|\d+\.)\s+(.+?)\s*$")
+            .expect("static plan-step regex must compile")
+    });
+
+    let mut steps = Vec::new();
+    for line in text.lines() {
+        if let Some(caps) = bullet.captures(line) {
+            let raw_title = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            let title = strip_markdown_emphasis(raw_title);
+            if title.is_empty() {
+                continue;
+            }
+            steps.push(PlanStep {
+                id: format!("step-{}", steps.len()),
+                title,
+                detail: None,
+                status: PlanStepStatus::Pending,
+            });
+        }
+    }
+    steps
+}
+
+fn strip_markdown_emphasis(s: &str) -> String {
+    // Replace **bold**, __bold__, *italic*, _italic_ markers with their
+    // inner text. Keep it permissive; the source is Claude's planning
+    // markdown, which is usually well-formed but occasionally drops a
+    // closing marker.
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"\*\*(.+?)\*\*|__(.+?)__|\*([^*]+?)\*|_([^_]+?)_")
+            .expect("static emphasis-strip regex must compile")
+    });
+    re.replace_all(s.trim(), |caps: &regex::Captures<'_>| {
+        for i in 1..=4 {
+            if let Some(m) = caps.get(i) {
+                return m.as_str().to_string();
+            }
+        }
+        String::new()
+    })
+    .into_owned()
+}
+
+/// Heuristic detector for the end of a `/compact` cycle. The Claude ACP
+/// adapter emits "Compacting..." while the compaction runs and
+/// "Compacting completed." once the model's context window has been
+/// replaced by a summary; both as plain `agent_message_chunk`s with no
+/// `_meta` flag (see #1050 for the upstream gap). String-matching on
+/// the completion message is fragile to localisation but the wrong-firing
+/// failure mode (an extra "context reset" divider) is harmless; it can
+/// never destroy transcript data.
+fn is_compact_completion(text: &str) -> bool {
+    text.contains("Compacting completed.")
+}
+
 /// Map an ACP `SessionUpdate` to the cockpit's typed `Event`. Variants we
 /// don't yet handle pass through as `RawAgentUpdate` so UI clients can at
 /// least see them; we'll narrow these as the schema stabilises.
 fn map_update_to_events(update: SessionUpdate) -> Vec<Event> {
     match update {
         SessionUpdate::AgentMessageChunk(chunk) => match chunk.content {
-            ContentBlock::Text(text) => vec![Event::AgentMessageChunk { text: text.text }],
+            ContentBlock::Text(text) => {
+                // /compact emits a plain text chunk ("Compacting completed.")
+                // and a usage_update with used=0; no typed signal. Detect
+                // the literal string the adapter uses and append a typed
+                // SessionContextReset event so the cockpit can render a
+                // divider, otherwise the silent context replacement leaves
+                // the chat looking unchanged while the model's view has
+                // been swapped out underneath the user. See #1050.
+                let mut events = vec![Event::AgentMessageChunk {
+                    text: text.text.clone(),
+                }];
+                if is_compact_completion(&text.text) {
+                    events.push(Event::SessionContextReset {
+                        reason: "Conversation compacted; earlier turns above \
+                                 are summarised in the model's context."
+                            .into(),
+                    });
+                    // /compact wipes the model's tool-state alongside the
+                    // chat history, so any TodoWrite plan it was tracking
+                    // is gone from its perspective. The cockpit plan strip
+                    // (PlanStrip + sidebar PlanProgressMini) lives in our
+                    // own event log though, so without this clear it keeps
+                    // showing a plan Claude no longer remembers; the user
+                    // then asks "resolve the first task" and Claude
+                    // responds "no task list." Emit an empty PlanUpdated
+                    // so the UI matches the model's actual context.
+                    events.push(Event::PlanUpdated {
+                        plan: Plan {
+                            plan_id: format!("plan-{}", chrono::Utc::now().timestamp_millis()),
+                            version: 1,
+                            steps: Vec::new(),
+                        },
+                    });
+                }
+                events
+            }
             other => vec![raw_event(&other)],
         },
         SessionUpdate::AgentThoughtChunk(_) => vec![Event::ThinkingStarted],
@@ -1016,6 +1298,17 @@ fn map_update_to_events(update: SessionUpdate) -> Vec<Event> {
             if let Some(diff) = extract_diff_from_locations(&tc.locations) {
                 events.push(Event::DiffEmitted { diff });
             }
+            // claude-agent-acp routes Claude's built-in ExitPlanMode through
+            // the tool channel (kind=switch_mode, plan markdown in
+            // raw_input.plan) instead of the structured SessionUpdate::Plan
+            // channel. Synthesise a PlanUpdated event so the cockpit's
+            // PlanStrip and the rest of the plan-aware UI light up. See
+            // #1059.
+            if matches!(tc.kind, agent_client_protocol::schema::ToolKind::SwitchMode) {
+                if let Some(plan) = extract_plan_from_switch_mode(&raw_args) {
+                    events.push(Event::PlanUpdated { plan });
+                }
+            }
             events
         }
         SessionUpdate::ToolCallUpdate(update) => {
@@ -1029,6 +1322,17 @@ fn map_update_to_events(update: SessionUpdate) -> Vec<Event> {
                 Some(agent_client_protocol::schema::ToolCallStatus::Completed)
                     | Some(agent_client_protocol::schema::ToolCallStatus::Failed)
             );
+            // claude-agent-acp emits the initial `tool_call` frame
+            // eagerly, often well before the underlying bash / read /
+            // edit actually starts running. Use `status: InProgress` as
+            // the canonical "running now" signal and re-stamp the
+            // tool's `started_at` so the duration label measures real
+            // tool runtime rather than adapter scheduling overhead.
+            // See #1060.
+            let in_progress = matches!(
+                update.fields.status,
+                Some(agent_client_protocol::schema::ToolCallStatus::InProgress)
+            );
             let content_text = update
                 .fields
                 .content
@@ -1038,11 +1342,16 @@ fn map_update_to_events(update: SessionUpdate) -> Vec<Event> {
             let new_args_preview = update.fields.raw_input.as_ref().map(preview_args);
             let new_title = update.fields.title.clone();
             let mut events: Vec<Event> = Vec::new();
-            if new_title.is_some() || new_args_preview.is_some() {
+            if new_title.is_some() || new_args_preview.is_some() || in_progress {
                 events.push(Event::ToolCallUpdated {
                     tool_call_id: id.clone(),
                     title: new_title,
                     args_preview: new_args_preview,
+                    started_at: if in_progress {
+                        Some(chrono::Utc::now())
+                    } else {
+                        None
+                    },
                 });
             }
             if completed {
@@ -1050,6 +1359,7 @@ fn map_update_to_events(update: SessionUpdate) -> Vec<Event> {
                     tool_call_id: id,
                     is_error,
                     content: content_text,
+                    completed_at: chrono::Utc::now(),
                 });
             } else if !content_text.is_empty() {
                 events.push(Event::ToolCallContent {
@@ -1062,22 +1372,73 @@ fn map_update_to_events(update: SessionUpdate) -> Vec<Event> {
             events
         }
         SessionUpdate::Plan(p) => {
-            let plan = Plan {
-                plan_id: format!("plan-{}", chrono::Utc::now().timestamp_millis()),
-                version: 1,
-                steps: p
-                    .entries
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, e)| PlanStep {
-                        id: format!("step-{i}"),
-                        title: e.content,
-                        detail: None,
-                        status: map_plan_status(e.status),
+            // Build the structured plan + a synthetic TodoWrite tool call
+            // from the same entries. claude-agent-acp routes Claude's
+            // TodoWrite through the structured `SessionUpdate::Plan`
+            // channel (not the tool channel), so without this synthesis
+            // the cockpit's PlanStrip + sidebar light up but no tool
+            // card ever renders; the user sees a plan appear "from
+            // nowhere" and has no per-update record of which calls
+            // produced which states. Emit a ToolCallStarted /
+            // ToolCallCompleted pair shaped to match what the
+            // TodoUpdateCard classifier in ToolCards.tsx expects
+            // (`name = "TodoWrite"`, `args.todos = [...]`), one per
+            // adapter update.
+            // Append a session-local monotonic counter so two plan updates
+            // arriving in the same millisecond don't share a synthetic ID
+            // (which would collide in the cockpit_events row keys and
+            // render as a single card instead of two).
+            let ts_ms = chrono::Utc::now().timestamp_millis();
+            let seq = SYNTHETIC_TOOL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let plan_id = format!("plan-{ts_ms}-{seq}");
+            let tool_id = format!("todo-{ts_ms}-{seq}");
+            let todos_json: Vec<serde_json::Value> = p
+                .entries
+                .iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "content": e.content,
+                        "status": plan_status_to_str(&e.status),
                     })
-                    .collect(),
-            };
-            vec![Event::PlanUpdated { plan }]
+                })
+                .collect();
+            let args_preview = serde_json::json!({ "todos": todos_json }).to_string();
+            let steps: Vec<PlanStep> = p
+                .entries
+                .into_iter()
+                .enumerate()
+                .map(|(i, e)| PlanStep {
+                    id: format!("step-{i}"),
+                    title: e.content,
+                    detail: None,
+                    status: map_plan_status(e.status),
+                })
+                .collect();
+            let now = chrono::Utc::now();
+            vec![
+                Event::ToolCallStarted {
+                    tool_call: ToolCall {
+                        id: tool_id.clone(),
+                        name: "TodoWrite".to_string(),
+                        kind: "think".to_string(),
+                        args_preview,
+                        started_at: now,
+                    },
+                },
+                Event::PlanUpdated {
+                    plan: Plan {
+                        plan_id,
+                        version: 1,
+                        steps,
+                    },
+                },
+                Event::ToolCallCompleted {
+                    tool_call_id: tool_id,
+                    is_error: false,
+                    content: String::new(),
+                    completed_at: now,
+                },
+            ]
         }
         SessionUpdate::CurrentModeUpdate(mode_update) => {
             let id = mode_update.current_mode_id.0.to_string();
@@ -1145,6 +1506,20 @@ fn map_plan_status(status: agent_client_protocol::schema::PlanEntryStatus) -> Pl
     }
 }
 
+/// Lowercase string form of a PlanEntryStatus for the synthetic
+/// TodoWrite args payload. Matches the values
+/// `web/src/components/cockpit/ToolCards.tsx::normaliseTodoStatus`
+/// accepts so the TodoUpdateCard renders the right glyph.
+fn plan_status_to_str(status: &agent_client_protocol::schema::PlanEntryStatus) -> &'static str {
+    use agent_client_protocol::schema::PlanEntryStatus;
+    match status {
+        PlanEntryStatus::Pending => "pending",
+        PlanEntryStatus::InProgress => "in_progress",
+        PlanEntryStatus::Completed => "completed",
+        _ => "pending",
+    }
+}
+
 fn raw_event<T: serde::Serialize>(value: &T) -> Event {
     Event::RawAgentUpdate {
         payload: serde_json::to_value(value).unwrap_or(serde_json::Value::Null),
@@ -1188,7 +1563,7 @@ fn preview_args(raw: &serde_json::Value) -> String {
 }
 
 /// Concat the textual portion of a tool call's `content` array. Drops
-/// non-text content blocks (images, resources, embedded terminals) — the
+/// non-text content blocks (images, resources, embedded terminals); the
 /// per-tool renderer fall-back path only knows how to display text. Diffs
 /// are surfaced separately via `extract_diff_from_locations` (and could
 /// later be picked up here too via `ToolCallContent::Diff`).
@@ -1257,7 +1632,7 @@ async fn run_connection_task<W, R>(
     // historical assistant turn replayed as agent_message_chunk
     // events). Our SQLite event store already has those events from
     // the original run, so passing them through would double the
-    // transcript on the next reload — every prior assistant bubble
+    // transcript on the next reload; every prior assistant bubble
     // appears once from disk replay, then again from the agent's
     // history dump. Suppress agent-side notifications during the
     // window between session/load success and the first user prompt;
@@ -1301,7 +1676,7 @@ async fn run_connection_task<W, R>(
                         // visible transcript (assistant chunks, tool
                         // calls, plans, etc.). Ambient state events
                         // (mode/usage/available_commands) and lifecycle
-                        // events (stopped, errors) must pass through —
+                        // events (stopped, errors) must pass through;
                         // otherwise the composer footer and pickers
                         // stay stale until the user types something.
                         if suppressing && is_transcript_event(&event) {
@@ -1406,8 +1781,8 @@ async fn run_connection_task<W, R>(
                 .terminal(true);
             // `initialize` is sent in both Fresh and Resume modes.
             // It's idempotent on every ACP agent we ship against
-            // (aoe-agent, claude-agent-acp) — the response only carries
-            // capability metadata — so re-sending it on attach is safe.
+            // (aoe-agent, claude-agent-acp); the response only carries
+            // capability metadata; so re-sending it on attach is safe.
             let init = connection
                 .send_request(
                     InitializeRequest::new(ProtocolVersion::V1)
@@ -1721,7 +2096,7 @@ async fn run_connection_task<W, R>(
                                             // freeze this select loop for the
                                             // duration of the round-trip,
                                             // defeating the point of polling
-                                            // cmd_rx concurrently — a Cancel
+                                            // cmd_rx concurrently; a Cancel
                                             // arriving while set_mode is in
                                             // flight would queue. The detached
                                             // task mirrors the success into the
@@ -1863,7 +2238,7 @@ async fn run_connection_task<W, R>(
     // In runner-managed mode (child is None) we deliberately don't kill
     // anything here: the per-worker `aoe __cockpit-runner` shim owns the
     // agent subprocess and outlives this daemon's connection. The socket
-    // file also stays — the runner cleans it up on its own exit.
+    // file also stays; the runner cleans it up on its own exit.
     if let Some(child) = child.as_ref() {
         let mut guard = child.lock().await;
         match guard.try_wait() {
@@ -2189,6 +2564,122 @@ mod tests {
     }
 
     #[test]
+    fn parse_plan_steps_extracts_dash_and_numbered_bullets() {
+        let md = "Here's the plan:\n\n- First, **read** the file\n- Then patch it\n1. Run tests\n2. Commit\n\nOther prose.";
+        let steps = parse_plan_steps(md);
+        let titles: Vec<&str> = steps.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec![
+                "First, read the file",
+                "Then patch it",
+                "Run tests",
+                "Commit"
+            ]
+        );
+        for s in &steps {
+            assert!(matches!(s.status, PlanStepStatus::Pending));
+        }
+    }
+
+    #[test]
+    fn parse_plan_steps_returns_empty_when_no_bullets() {
+        assert!(parse_plan_steps("Just a paragraph with no list.").is_empty());
+        assert!(parse_plan_steps("").is_empty());
+    }
+
+    #[test]
+    fn extract_plan_from_switch_mode_handles_missing_plan_field() {
+        let v = serde_json::json!({});
+        assert!(extract_plan_from_switch_mode(&v).is_none());
+        let v = serde_json::json!({ "plan": 42 });
+        assert!(extract_plan_from_switch_mode(&v).is_none());
+    }
+
+    #[test]
+    fn extract_plan_from_switch_mode_builds_plan_when_input_has_bullets() {
+        let v = serde_json::json!({
+            "plan": "- Step one\n- Step two\n- Step three"
+        });
+        let plan = extract_plan_from_switch_mode(&v).expect("plan should parse");
+        assert_eq!(plan.steps.len(), 3);
+        assert_eq!(plan.steps[0].title, "Step one");
+    }
+
+    #[test]
+    fn strip_markdown_emphasis_unwraps_bold_and_italic() {
+        assert_eq!(strip_markdown_emphasis("**bold**"), "bold");
+        assert_eq!(strip_markdown_emphasis("__bold__"), "bold");
+        assert_eq!(strip_markdown_emphasis("*italic*"), "italic");
+        assert_eq!(strip_markdown_emphasis("_italic_"), "italic");
+        assert_eq!(
+            strip_markdown_emphasis("mix of **bold** and *italic*"),
+            "mix of bold and italic"
+        );
+        assert_eq!(strip_markdown_emphasis("plain"), "plain");
+    }
+
+    #[test]
+    fn is_compact_completion_matches_adapter_string() {
+        assert!(is_compact_completion("Compacting completed."));
+        assert!(is_compact_completion("\n\nCompacting completed.\n"));
+        assert!(!is_compact_completion("Compacting..."));
+        assert!(!is_compact_completion("compact done"));
+        assert!(!is_compact_completion(""));
+    }
+
+    #[test]
+    fn resolve_agent_command_returns_none_for_absolute_path() {
+        assert!(resolve_agent_command("/usr/local/bin/claude-agent-acp").is_none());
+        assert!(resolve_agent_command("./relative/path").is_none());
+    }
+
+    #[test]
+    fn resolve_agent_command_returns_none_for_placeholder() {
+        assert!(resolve_agent_command("${aoe_data_dir}/cockpit-worker/dist/aoe-agent").is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_agent_command_finds_binary_in_path_env() {
+        // Build a temp dir with a fake binary, point PATH at it.
+        // Tagged `#[serial]` because the test mutates the process-wide
+        // PATH; any concurrent test that reads PATH (e.g. resolves a
+        // real binary) would race.
+        let dir = tempfile::TempDir::new().unwrap();
+        let bin = dir.path().join("aoe-test-resolver-fake");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let prev = std::env::var_os("PATH");
+        let new_path = format!(
+            "{}:{}",
+            dir.path().display(),
+            prev.as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        );
+        // SAFETY: this test mutates the process-wide PATH. Other PATH
+        // readers in the same test binary would race; `#[serial]` keeps
+        // them apart.
+        unsafe {
+            std::env::set_var("PATH", &new_path);
+        }
+        let resolved = resolve_agent_command("aoe-test-resolver-fake");
+        if let Some(prev) = prev {
+            unsafe {
+                std::env::set_var("PATH", prev);
+            }
+        }
+        let (path, parent) = resolved.expect("binary should resolve from PATH");
+        assert_eq!(path, bin);
+        assert_eq!(parent, dir.path());
+    }
+
+    #[test]
     fn pick_option_id_finds_allow_once() {
         use agent_client_protocol::schema::{PermissionOption, PermissionOptionId};
         let options = vec![
@@ -2266,6 +2757,7 @@ mod tests {
                 tool_call_id,
                 is_error,
                 content,
+                completed_at: _,
             } => {
                 assert_eq!(tool_call_id, "tc-1");
                 assert!(!*is_error);
@@ -2287,8 +2779,21 @@ mod tests {
             ))]);
         let update = ToolCallUpdate::new("tc-2", fields);
         let events = map_update_to_events(SessionUpdate::ToolCallUpdate(update));
-        assert_eq!(events.len(), 1);
+        // InProgress now emits a ToolCallUpdated re-stamping started_at
+        // (#1060 follow-up) plus the streaming ToolCallContent.
+        assert_eq!(events.len(), 2);
         match &events[0] {
+            Event::ToolCallUpdated {
+                tool_call_id,
+                started_at,
+                ..
+            } => {
+                assert_eq!(tool_call_id, "tc-2");
+                assert!(started_at.is_some());
+            }
+            other => panic!("expected ToolCallUpdated, got {other:?}"),
+        }
+        match &events[1] {
             Event::ToolCallContent {
                 tool_call_id,
                 content,
@@ -2297,6 +2802,32 @@ mod tests {
                 assert_eq!(content, "partial output");
             }
             other => panic!("expected ToolCallContent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_tool_call_update_in_progress_restamps_started_at() {
+        use agent_client_protocol::schema::{ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields};
+        let fields = ToolCallUpdateFields::new().status(ToolCallStatus::InProgress);
+        let update = ToolCallUpdate::new("tc-3", fields);
+        let events = map_update_to_events(SessionUpdate::ToolCallUpdate(update));
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Event::ToolCallUpdated {
+                tool_call_id,
+                started_at,
+                title,
+                args_preview,
+            } => {
+                assert_eq!(tool_call_id, "tc-3");
+                assert!(
+                    started_at.is_some(),
+                    "InProgress must carry a re-stamped started_at"
+                );
+                assert!(title.is_none());
+                assert!(args_preview.is_none());
+            }
+            other => panic!("expected ToolCallUpdated, got {other:?}"),
         }
     }
 

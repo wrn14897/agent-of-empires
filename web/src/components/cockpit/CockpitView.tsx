@@ -21,10 +21,10 @@ import {
 import { ChevronDown, ListChecks } from "lucide-react";
 
 import { ApprovalCard } from "./ApprovalCard";
-import { CockpitRuntime, type CockpitContext } from "./CockpitRuntime";
+import { CockpitRuntime, TOOL_GROUP_NAME, type CockpitContext } from "./CockpitRuntime";
 import { Composer } from "./Composer";
 import { Markdown } from "./Markdown";
-import { ToolCard } from "./ToolCards";
+import { ToolCard, ToolGroupCard } from "./ToolCards";
 import {
   SPINNER_FRAMES,
   SPINNER_INTERVAL_MS,
@@ -214,17 +214,31 @@ function toolCallTimestamp(id: string): string {
 }
 
 function AssistantToolCall(props: ToolCallProps) {
+  // Synthetic group-of-tool-calls part. CockpitRuntime's build pass
+  // folds runs of ≥3 consecutive tool-call parts (between agent text)
+  // into one collapsible block (#1057). The children payload carries
+  // the original per-tool parts verbatim so the group card can render
+  // each one with its normal per-kind card on expand.
+  if (props.toolName === TOOL_GROUP_NAME) {
+    return <AssistantToolGroup argsText={props.argsText} />;
+  }
+
   // Reconstruct the ToolCall shape our existing ToolCards.tsx
   // renderer expects. assistant-ui carries `toolName` (we set this to
   // ACP's lowercased ToolKind in CockpitRuntime) plus argsText (the
-  // truncated JSON preview from the agent).
-  const stableAt = toolCallTimestamp(props.toolCallId);
+  // truncated JSON preview from the agent). The real `started_at` and
+  // completion `endedAt` are smuggled through argsText/result by
+  // CockpitRuntime's AssistantBuilder so the duration label (#1060)
+  // reflects actual tool runtime instead of "time between renders".
+  const fallbackAt = toolCallTimestamp(props.toolCallId);
+  const startedAt = pickStartedAt(props.args, props.argsText) ?? fallbackAt;
+  const endedAt = pickEndedAt(props.result) ?? fallbackAt;
   const tool: ToolCall = {
     id: props.toolCallId,
     name: prettifyToolName(props.toolName, props.args),
     kind: props.toolName,
     args_preview: props.argsText ?? safeStringify(props.args ?? null),
-    started_at: stableAt,
+    started_at: startedAt,
   };
   const resultContent =
     props.result &&
@@ -241,10 +255,110 @@ function AssistantToolCall(props: ToolCallProps) {
             : ("tool_complete" as const),
           text: resultContent,
           toolCallId: props.toolCallId,
-          at: stableAt,
+          at: endedAt,
         }
       : undefined;
   return <ToolCard tool={tool} result={result} />;
+}
+
+/** Read the real `_aoe_started_at` ISO timestamp out of the
+ *  tool-call args. Returns null when neither the parsed `args` object
+ *  nor the raw `argsText` carries it; caller falls back to a minted
+ *  client time. */
+function pickStartedAt(
+  args: Record<string, unknown> | undefined,
+  argsText: string | undefined,
+): string | null {
+  if (args && typeof args._aoe_started_at === "string") {
+    return args._aoe_started_at;
+  }
+  if (argsText) {
+    try {
+      const parsed = JSON.parse(argsText);
+      if (
+        parsed &&
+        typeof parsed === "object" &&
+        !Array.isArray(parsed) &&
+        typeof (parsed as Record<string, unknown>)._aoe_started_at === "string"
+      ) {
+        return (parsed as Record<string, string>)._aoe_started_at ?? null;
+      }
+    } catch {
+      // ignore
+    }
+  }
+  return null;
+}
+
+/** Read the smuggled `endedAt` field set by AssistantBuilder.completeToolCall. */
+function pickEndedAt(result: unknown): string | null {
+  if (
+    result &&
+    typeof result === "object" &&
+    "endedAt" in (result as Record<string, unknown>)
+  ) {
+    const v = (result as { endedAt?: unknown }).endedAt;
+    if (typeof v === "string") return v;
+  }
+  return null;
+}
+
+interface GroupChild {
+  toolCallId: string;
+  toolName: string;
+  argsText: string;
+  result?: { content: string; endedAt?: string };
+  isError?: boolean;
+}
+
+function AssistantToolGroup({ argsText }: { argsText?: string }) {
+  let children: GroupChild[] = [];
+  if (argsText) {
+    try {
+      const parsed = JSON.parse(argsText);
+      if (parsed && Array.isArray(parsed.children)) {
+        children = parsed.children as GroupChild[];
+      }
+    } catch {
+      // Malformed payload; fall through to an empty group rather than
+      // crashing the assistant-ui render.
+    }
+  }
+  const items = children.map((c) => {
+    const fallbackAt = toolCallTimestamp(c.toolCallId);
+    let parsedArgs: Record<string, unknown> = {};
+    try {
+      const p = JSON.parse(c.argsText);
+      if (p && typeof p === "object" && !Array.isArray(p)) {
+        parsedArgs = p as Record<string, unknown>;
+      }
+    } catch {
+      // ignore
+    }
+    const startedAt = pickStartedAt(parsedArgs, c.argsText) ?? fallbackAt;
+    const endedAt = pickEndedAt(c.result) ?? fallbackAt;
+    const tool: ToolCall = {
+      id: c.toolCallId,
+      name: prettifyToolName(c.toolName, parsedArgs),
+      kind: c.toolName,
+      args_preview: c.argsText,
+      started_at: startedAt,
+    };
+    const result =
+      c.result !== undefined
+        ? {
+            id: `done-${c.toolCallId}`,
+            kind: c.isError
+              ? ("tool_error" as const)
+              : ("tool_complete" as const),
+            text: c.result.content,
+            toolCallId: c.toolCallId,
+            at: endedAt,
+          }
+        : undefined;
+    return { tool, result, kind: c.toolName };
+  });
+  return <ToolGroupCard items={items} />;
 }
 
 function prettifyToolName(
@@ -369,10 +483,20 @@ function PlanStrip({ plan, mode }: PlanStripProps) {
   // The mode picker now lives in the composer footer.
   if (!plan && mode === "Default") return null;
 
-  const current = plan?.steps.find((s) => s.status === "InProgress");
+  // Pick the active step: prefer an explicit `InProgress` (Claude's
+  // ExitPlanMode bridge sets this), otherwise fall back to the first
+  // non-Done / non-Cancelled step (TodoWrite-produced plans typically
+  // arrive with all entries Pending). Mirrors the server-side
+  // `plan_summary_from_plan` logic so the strip and sidebar agree.
+  const current =
+    plan?.steps.find((s) => s.status === "InProgress") ??
+    plan?.steps.find(
+      (s) => s.status !== "Done" && s.status !== "Cancelled",
+    );
   const completed = plan?.steps.filter((s) => s.status === "Done").length ?? 0;
   const totalSteps = plan?.steps.length ?? 0;
   const pct = totalSteps > 0 ? Math.round((completed / totalSteps) * 100) : 0;
+  const allDone = totalSteps > 0 && completed === totalSteps;
 
   return (
     <div className="border-b border-surface-800 bg-surface-900/95 backdrop-blur">
@@ -383,7 +507,7 @@ function PlanStrip({ plan, mode }: PlanStripProps) {
       >
         <ListChecks className="h-3.5 w-3.5 shrink-0 text-text-dim" />
         <span className="truncate text-text-primary">
-          {current?.title ?? (plan ? "all steps complete" : "—")}
+          {current?.title ?? (allDone ? "all steps complete" : "…")}
         </span>
         {plan && (
           <span className="ml-auto flex items-center gap-2">
@@ -721,7 +845,7 @@ function StartupErrorBanner({
             and restart <code className="rounded bg-rose-900/60 px-1">aoe serve</code>,
             or free a slot by deleting an existing cockpit session
             or switching one to the tmux substrate. Reinstalling the adapter
-            won't help — the adapter is fine, the cap is the limit.
+            won't help; the adapter is fine, the cap is the limit.
           </>
         ) : (
           <>
