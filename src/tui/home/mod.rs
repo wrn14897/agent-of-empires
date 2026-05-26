@@ -392,35 +392,10 @@ pub struct HomeView {
     /// latency. Dropping (set to None when live mode exits) closes the
     /// channel and the worker thread exits cleanly on its own.
     pub(super) live_send_worker: Option<live_send::LiveSendWorker>,
-    /// Long-lived `tmux -C` connection shared between the preview-
-    /// refresh path and the live-send worker thread. The connection
-    /// is the sole transport for keystrokes, resizes, and pane
-    /// captures while live-send is active. `enter_live_send` requires
-    /// it: if `ControlModeClient::spawn` fails, live mode is not
-    /// entered and the user sees a "Live send failed" dialog.
-    ///
-    /// Wrapped in `Arc` so the worker thread can hold one clone and
-    /// the render path another. Cleared on exit and on a render-path
-    /// capture error (the worker's clone keeps the underlying client
-    /// alive until the worker also drops, which happens when the
-    /// caller clears `live_send_worker`).
-    ///
-    /// See `src/tmux/control_mode.rs` and #1485.
-    pub(super) control_mode_client: Option<std::sync::Arc<crate::tmux::ControlModeClient>>,
     /// Last (cols, rows) we asked the worker to resize the pane to in
     /// the current live-send session. Used to dedup the resize messages
     /// fired from the preview refresh path; cleared on live-send exit.
     pub(super) live_send_last_resize: Option<(u16, u16)>,
-    /// Count of consecutive `capture_via_control_mode` failures in the
-    /// current live-send session. Reset to 0 on every successful capture
-    /// and on `enter_live_send`. The capture path tears down the
-    /// control-mode client only once this count reaches
-    /// `MAX_LIVE_CAPTURE_FAILURES`, so transient timeouts (the worker
-    /// and main thread contending on the socket while %output piles up)
-    /// don't permanently blank the preview. The client tear-down still
-    /// happens when the connection is genuinely dead, just after a few
-    /// retries instead of one.
-    pub(super) live_send_capture_failures: u32,
     /// Pasted text captured at the home view that we couldn't immediately
     /// route (no session selected, cursor on a group header, etc.). Drained
     /// into the next compose dialog the user opens, so voice/dictation never
@@ -737,9 +712,7 @@ impl HomeView {
             pending_send_session: None,
             live_send: None,
             live_send_worker: None,
-            control_mode_client: None,
             live_send_last_resize: None,
-            live_send_capture_failures: 0,
             pending_paste: None,
             pending_attach_after_warning: None,
             pending_stop_session: None,
@@ -2458,17 +2431,7 @@ impl HomeView {
     /// fired during respawn, `Ok(None)` on a clean ready, and `Err(())`
     /// if the pane could not be readied (`info_dialog` is set with the
     /// underlying error so the caller only has to clear its toast).
-    ///
-    /// `on_output_wake`, when `Some`, is invoked from the control-mode
-    /// reader thread whenever tmux emits `%output`. The expected
-    /// caller (App's main loop) wires this through to a tokio mpsc so
-    /// it can wake out of `select!` on agent output and re-capture
-    /// the preview without waiting for the next timer tick.
-    pub fn enter_live_send(
-        &mut self,
-        session_id: &str,
-        on_output_wake: Option<Box<dyn Fn() + Send + 'static>>,
-    ) -> Result<Option<String>, ()> {
+    pub fn enter_live_send(&mut self, session_id: &str) -> Result<Option<String>, ()> {
         let outcome = self.try_mutate_instance_writeback_on_err(session_id, |inst| {
             inst.ensure_pane_ready().map_err(Into::into)
         });
@@ -2518,14 +2481,25 @@ impl HomeView {
         };
         let tmux_name = tmux_session.name().to_string();
         // Switching live mode from session A to session B (click on a
-        // different row while already live) overwrites `live_send` and
-        // drops the old worker, but the previous tmux session is still
-        // pinned to manual sizing from live-send's per-keystroke resize
-        // loop. Reset it now so leaving A in the background doesn't
-        // strand it at the preview-pane dimensions.
-        if let Some(prev) = self.live_send.as_ref() {
-            if prev.tmux_name != tmux_name {
-                crate::tmux::Session::from_name(&prev.tmux_name).reset_size_to_latest_client();
+        // different row while already live): we need to drop the old
+        // worker BEFORE resetting the old session's window-size,
+        // otherwise any `Resize` still queued in the old worker can
+        // fire after the reset and flip the old pane back to manual
+        // sizing. The worker thread is intentionally not joined, so
+        // dropping its `Sender` is the only way to know its dispatch
+        // loop has finished (its `recv` returns Err and the thread
+        // exits on the next iteration).
+        let prev_tmux_name = self
+            .live_send
+            .as_ref()
+            .map(|state| state.tmux_name.clone())
+            .filter(|name| name != &tmux_name);
+        if prev_tmux_name.is_some() {
+            // Drop worker first so its queued resizes (if any) drain
+            // against the old session before we reset its sizing.
+            self.live_send_worker = None;
+            if let Some(name) = &prev_tmux_name {
+                crate::tmux::Session::from_name(name).reset_size_to_latest_client();
             }
         }
         // Parse the configured exit-chord list now so the per-keystroke
@@ -2543,42 +2517,69 @@ impl HomeView {
             tmux_name: tmux_name.clone(),
             exit_chords,
         });
-        // Live-send is built on a single `tmux -C` control-mode
-        // connection that carries keystrokes, resizes, AND preview
-        // captures. Spawning it has to succeed; the fork-based path
-        // is gone. If spawn fails the user gets a dialog and stays on
-        // the home view.
-        let control_client = match crate::tmux::ControlModeClient::spawn(&tmux_name, on_output_wake)
-        {
-            Ok(client) => std::sync::Arc::new(client),
-            Err(err) => {
-                tracing::warn!(
-                    target: "tmux.control_mode",
-                    error = %err,
-                    "control-mode spawn failed; aborting live-send entry",
-                );
-                self.info_dialog = Some(InfoDialog::new(
-                    "Live send failed",
-                    &format!("Cannot open tmux control-mode connection: {}", err),
-                ));
-                // Roll back the live_send state we just installed so
-                // the home view's banner doesn't show LIVE without a
-                // working transport.
-                self.live_send = None;
-                return Err(());
-            }
-        };
-        self.live_send_worker = Some(live_send::LiveSendWorker::spawn(control_client.clone()));
-        self.control_mode_client = Some(control_client);
-        // Force the preview-refresh path to issue a resize on the
-        // first draw inside live mode (it dedups against
-        // live_send_last_resize), so the agent's render matches the
-        // preview pane's actual dimensions instead of whatever the
-        // session was last sized to.
+        // Spawn the background worker that dispatches translated
+        // keystrokes as one-shot `tmux send-keys` subprocesses (the
+        // pre-#1485 path; control-mode was tried as an optimization
+        // but turned out to be unreliable on real-world tmux setups
+        // and was removed in favor of this simpler model).
+        self.live_send_worker = Some(live_send::LiveSendWorker::spawn(tmux_name.clone()));
+        // Synchronously resize the pane to match what the next refresh
+        // will ask for, so the first frame already shows the agent
+        // re-laid-out at the new size. Without this the first frame
+        // captures the OLD pane and frame 2 (after the async worker
+        // resize completes) jumps to the new size: the visible
+        // "shift" the user perceives on entering live mode.
+        //
+        // Use `self.preview_area` (the cached INNER rect) directly.
+        // The preview pane uses `Borders::ALL` + `Padding::horizontal(1)`,
+        // so `inner.width = outer.width - 4` and `inner.height =
+        // outer.height - 2`. Earlier versions of this code subtracted
+        // 2 from both dimensions of `preview_outer_area`, which was off
+        // by 2 columns and caused the very thing it was meant to
+        // prevent: the next refresh saw a different inner.width,
+        // detected the dedup miss, and queued ANOTHER async resize.
         self.live_send_last_resize = None;
-        // Fresh client, fresh budget: any failure count carried over from
-        // a previous live-send session is irrelevant to this one.
-        self.live_send_capture_failures = 0;
+        let inner = self.preview_area;
+        if inner.width > 0 && inner.height > 0 {
+            let resize_status = std::process::Command::new("tmux")
+                .args([
+                    "resize-window",
+                    "-t",
+                    &tmux_name,
+                    "-x",
+                    &inner.width.to_string(),
+                    "-y",
+                    &inner.height.to_string(),
+                ])
+                .stderr(std::process::Stdio::null())
+                .status();
+            // Only register the dedup if the resize subprocess
+            // actually succeeded. If tmux failed (session died
+            // between our state install and now, tmux binary
+            // missing, etc.), leaving `live_send_last_resize` as
+            // None lets the next `refresh_preview_cache_if_needed`
+            // try the resize again through the worker.
+            if matches!(&resize_status, Ok(s) if s.success()) {
+                self.live_send_last_resize = Some((inner.width, inner.height));
+            }
+            // Give the agent ~50ms to handle SIGWINCH and re-lay out
+            // before we capture the first frame. Some agents (claude-
+            // code in particular) do a full clear-screen + redraw on
+            // resize; capturing during that produces a partial frame.
+            // 50ms is the smallest delay that empirically lets the
+            // most-common agents settle.
+            //
+            // Wrap the sleep in `block_in_place` so the tokio
+            // multi-threaded runtime can reschedule any other tasks
+            // off this worker for the duration. Without it, the 50ms
+            // would block every other tokio task (status pollers,
+            // update checks, etc.) from running on this thread. The
+            // call is a no-op on a current-thread runtime; aoe
+            // always uses multi-threaded (`#[tokio::main]`).
+            tokio::task::block_in_place(|| {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            });
+        }
         self.stamp_last_accessed(session_id);
         Ok(stale_sid)
     }

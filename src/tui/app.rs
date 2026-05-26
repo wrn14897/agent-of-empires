@@ -97,39 +97,6 @@ pub struct App {
     /// reader thread on stdin; if it's alive when tmux attach-session starts,
     /// the two compete for stdin and tmux fails to initialize its client.
     event_stream: Option<EventStream>,
-    /// Wake channel from the live-send control-mode reader thread:
-    /// fires `()` every time tmux emits `%output` (the agent rendered
-    /// bytes). The main loop selects on the receiver to break out of
-    /// idle without waiting for the next tokio ticker, so preview
-    /// updates land within the round-trip rather than up to one tick
-    /// later. The sender is cloned into a callback and handed to
-    /// `ControlModeClient::spawn` via `HomeView::enter_live_send`.
-    ///
-    /// Capacity 1 + `try_send` is the canonical pattern for
-    /// coalescing wake notifications: when the buffer already holds
-    /// a pending wake, additional `%output` lines drop the send
-    /// silently (the main loop will see the queued wake on its next
-    /// iteration). An unbounded channel would let wakes pile up
-    /// without backpressure if the main loop ever stalls.
-    live_send_wake_tx: tokio::sync::mpsc::Sender<()>,
-    live_send_wake_rx: tokio::sync::mpsc::Receiver<()>,
-    /// Snapshot of the most recently completed full-render buffer.
-    /// Stashed only while live-send is active (the only consumer of
-    /// the preview-only fast path); cleared when the user exits live
-    /// mode or the terminal resizes. The fast path repaints these
-    /// cells into a fresh back buffer and then re-renders only the
-    /// preview pane, so the cost of a `%output` wake drops from
-    /// "rebuild the whole HomeView widget tree" to "memcpy cells
-    /// plus refresh the preview cache + paragraph." See
-    /// `Self::draw_preview_only`.
-    last_full_frame: Option<ratatui::buffer::Buffer>,
-    /// OUTER rect of the preview pane in `last_full_frame` (block +
-    /// borders + content). Captured from `HomeView::preview_outer_area`
-    /// immediately after the full draw that produced the snapshot.
-    /// The fast path re-renders the preview pane at this rect by
-    /// calling back into `render_preview`, which expects the OUTER
-    /// rect and computes its own inner.
-    last_full_frame_preview_area: ratatui::layout::Rect,
     /// Tracks whether we currently have xterm mouse-tracking enabled. The TUI
     /// turns it off while a copy-friendly surface is open (`HomeView::
     /// wants_text_selection`) so users can drag-select natively, then turns
@@ -255,15 +222,6 @@ impl App {
 
         let dismissed_update_version = config.app_state.dismissed_update_version.clone();
 
-        // Live-send wake channel: the sender is cloned into the
-        // control-mode reader-thread callback on each
-        // `enter_live_send`; the receiver is consumed by the main
-        // loop's `tokio::select!` branch so agent output wakes the
-        // loop without waiting for the next ticker. Capacity 1 so
-        // additional wakes coalesce while the main loop is between
-        // iterations; see the field docs above.
-        let (live_send_wake_tx, live_send_wake_rx) = tokio::sync::mpsc::channel::<()>(1);
-
         Ok(Self {
             home,
             should_quit: false,
@@ -275,10 +233,6 @@ impl App {
             update_status_rx: None,
             dismissed_update_version,
             event_stream: Some(EventStream::new()),
-            live_send_wake_tx,
-            live_send_wake_rx,
-            last_full_frame: None,
-            last_full_frame_preview_area: ratatui::layout::Rect::default(),
             // Initial state matches whatever `tui::run` did at startup;
             // capture is on by default, off only if AOE_MOUSE_CAPTURE=0.
             mouse_captured: crate::tui::mouse_capture_requested(),
@@ -335,32 +289,7 @@ impl App {
         )?;
         let draw_result = (|| -> Result<()> {
             crossterm::execute!(terminal.backend_mut(), crossterm::cursor::Hide)?;
-            let completed = terminal.draw(|f| self.render(f))?;
-            // Snapshot the freshly drawn frame so a subsequent
-            // `%output` wake can take the preview-only fast path
-            // (see `draw_preview_only`). Only stash when live-send is
-            // active and no OTHER overlay is covering the home view;
-            // the snapshot is useless in any other state and the clone
-            // cost (one `Vec<Cell>` walk plus a `Cell::clone` per
-            // cell, ~12K cells on a 200x60 pane) is real per draw, so
-            // we skip it when no fast-path render can consume it.
-            //
-            // `has_dialog()` includes `live_send.is_some()`, which would
-            // gate off the very mode this fast path exists for — use
-            // `has_non_live_send_overlay()` so live-send itself counts
-            // as "no overlay" but settings / diff / dialogs still do.
-            //
-            // The saved rect is the OUTER preview area (block + borders +
-            // content). The fast path re-renders the preview by passing
-            // this rect back through `render_preview`, which expects the
-            // OUTER rect and computes its own inner; passing the inner
-            // here would make `render_preview` draw a nested block.
-            if self.home.live_send.is_some() && !self.home.has_non_live_send_overlay() {
-                self.last_full_frame = Some(completed.buffer.clone());
-                self.last_full_frame_preview_area = self.home.preview_outer_area;
-            } else {
-                self.last_full_frame = None;
-            }
+            terminal.draw(|f| self.render(f))?;
             Ok(())
         })();
         let end_result = crossterm::execute!(
@@ -370,73 +299,6 @@ impl App {
         draw_result?;
         end_result?;
         Ok(())
-    }
-
-    /// Fast-path draw for live-send `%output` wakes: repaint the last
-    /// full frame's cells into the new back buffer, then re-render
-    /// only the preview pane on top. ratatui's per-cell diff sees
-    /// changes only in the preview rect and writes a minimal delta
-    /// to the terminal. Total cost is ~1 buffer-clone + 1 preview
-    /// refresh vs. the full HomeView widget rebuild (sidebar, status
-    /// bar, dialogs, update banner) the slow path runs.
-    ///
-    /// Returns `Ok(false)` when the fast path bailed (no snapshot,
-    /// dimensions don't match, etc.) so the caller can fall back to
-    /// the full draw. Returns `Ok(true)` on success.
-    fn draw_preview_only(
-        &mut self,
-        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    ) -> Result<bool> {
-        let Some(snapshot) = self.last_full_frame.clone() else {
-            return Ok(false);
-        };
-        // Resize between the snapshot and this draw invalidates the
-        // snapshot: a different terminal size means a different layout
-        // and a different preview rect, and the snapshot's cells
-        // wouldn't line up. Bail to the full path so the next draw
-        // rebuilds everything at the new size.
-        let current_area = terminal.size().map(|sz| ratatui::layout::Rect {
-            x: 0,
-            y: 0,
-            width: sz.width,
-            height: sz.height,
-        });
-        if current_area.map(|c| c != snapshot.area).unwrap_or(true) {
-            self.last_full_frame = None;
-            return Ok(false);
-        }
-        let preview_area = self.last_full_frame_preview_area;
-        if preview_area.width == 0 || preview_area.height == 0 {
-            return Ok(false);
-        }
-
-        crossterm::execute!(
-            terminal.backend_mut(),
-            crossterm::terminal::BeginSynchronizedUpdate
-        )?;
-        let draw_result = (|| -> Result<()> {
-            crossterm::execute!(terminal.backend_mut(), crossterm::cursor::Hide)?;
-            terminal.draw(|f| {
-                let area = f.area();
-                // Step 1: paint the snapshot into the back buffer.
-                f.render_widget(SnapshotPainter::new(&snapshot), area);
-                // Step 2: re-render only the preview region. ratatui's
-                // diff will then write just the changed preview cells
-                // (sidebar/status bar already match the previous
-                // frame because we just painted them in step 1, so
-                // their diff is empty).
-                self.home
-                    .render_preview_pane_only(f, preview_area, &self.theme);
-            })?;
-            Ok(())
-        })();
-        let end_result = crossterm::execute!(
-            terminal.backend_mut(),
-            crossterm::terminal::EndSynchronizedUpdate
-        );
-        draw_result?;
-        end_result?;
-        Ok(true)
     }
 
     /// Temporarily leave TUI mode, run a closure, and restore TUI mode.
@@ -612,8 +474,34 @@ impl App {
             (hup.ok(), term.ok())
         };
 
-        let mut refresh_interval = tokio::time::interval(Duration::from_millis(50));
+        // 33ms ticker (~30fps) is the steady-state refresh in live-send.
+        // 16ms (60fps) was tried but produced visible tearing on
+        // terminals that don't support synchronized-update escapes
+        // (notably macOS Terminal.app); back-to-back ticker + post-key
+        // wakes within ~1ms also doubled-up frame writes. 33ms gives
+        // each frame's writes enough time to land before the next
+        // frame starts, while remaining responsive enough that
+        // animation looks fluid. The post-key wake below covers the
+        // typing-echo case where 33ms would feel laggy.
+        let mut refresh_interval = tokio::time::interval(Duration::from_millis(33));
         refresh_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // After any keystroke routed to live-send, schedule one extra
+        // refresh ~15ms later (roughly the `tmux send-keys` fork plus
+        // agent-echo time) so the resulting capture catches the echo
+        // deterministically instead of waiting up to one full ticker
+        // interval. Cleared when the wake fires; re-armed by each
+        // subsequent key.
+        let mut last_live_key_at: Option<std::time::Instant> = None;
+        const POST_KEY_WAKE_DELAY: Duration = Duration::from_millis(15);
+        // Track when the last refresh fired so the ticker arm can
+        // back off if a post-key wake just ran. Without this, a key
+        // pressed ~10ms before a ticker tick produces two refreshes
+        // back-to-back (post-key wake at +15ms, ticker at +16ms),
+        // which on a non-sync-update terminal looks like tearing:
+        // the first frame's per-cell writes are still landing when
+        // the second frame starts overwriting them.
+        let mut last_refresh_at: Option<std::time::Instant> = None;
+        const REFRESH_COOLDOWN: Duration = Duration::from_millis(15);
         let mut last_status_refresh = std::time::Instant::now();
         let mut last_disk_refresh = std::time::Instant::now();
         let mut last_spinner_redraw = std::time::Instant::now();
@@ -642,10 +530,11 @@ impl App {
                 self.needs_redraw = false;
             }
 
-            // Reset per-iteration flags. Set inside the select! branches
-            // and consumed after the periodic-refresh block below to
-            // decide between the preview-only fast path and a full draw.
-            let mut woke_via_live_send_wake = false;
+            // Compute the post-key wake deadline once per iteration so
+            // the select! arm doesn't have to dance with the Option.
+            // `None` here becomes `pending` inside the arm.
+            let post_key_deadline = last_live_key_at.map(|t| t + POST_KEY_WAKE_DELAY);
+            let mut woke_via_post_key = false;
 
             // All event sources are polled cooperatively via tokio::select!.
             // This ensures signal futures actually get scheduled (fixing #608
@@ -764,11 +653,39 @@ impl App {
                             self.handle_key(key, terminal).await?;
                             self.sync_mouse_capture(terminal)?;
 
-                            // Skip the draw when returning from tmux attach.
-                            // needs_redraw triggers a clear + stale event drain
-                            // on the next iteration; drawing before that drain
-                            // wastes a frame and can flicker.
-                            if !self.needs_redraw {
+                            // Arm the post-key wake when the key was
+                            // routed into live-send. We don't have an
+                            // explicit signal from handle_key for that
+                            // (it returns ()), but `live_send.is_some()`
+                            // after the call is a good proxy: a key
+                            // that EXITS live-send won't arm a wake,
+                            // and keys outside live-send leave it None
+                            // anyway since we never set it.
+                            let live_after = self.home.live_send.is_some();
+                            if live_after {
+                                last_live_key_at = Some(std::time::Instant::now());
+                            }
+
+                            // Skip the immediate draw when:
+                            //   - We're returning from tmux attach
+                            //     (`needs_redraw` triggers a clear +
+                            //     stale event drain on the next
+                            //     iteration; drawing before the drain
+                            //     wastes a frame and can flicker), OR
+                            //   - We're inside live-send. The key was
+                            //     queued to the worker but has NOT been
+                            //     dispatched to tmux yet, so the home
+                            //     view's preview cache is still stale.
+                            //     Drawing now produces a frame
+                            //     identical to the previous one
+                            //     (ratatui's diff is empty) and then
+                            //     the post-key wake fires ~15ms later
+                            //     with fresh post-echo content.
+                            //     Skipping the immediate draw avoids a
+                            //     no-op paint that on non-sync-update
+                            //     terminals can still emit cursor-move
+                            //     bytes mid-frame.
+                            if !self.needs_redraw && !live_after {
                                 self.draw(terminal)?;
                             }
 
@@ -935,18 +852,16 @@ impl App {
                     }
                 }
                 _ = refresh_interval.tick() => {}
-                // Wake on every `%output` from a live-send tmux
-                // control-mode connection. The receiver only fires
-                // while live-send is active (the sender lives in the
-                // reader thread owned by `ControlModeClient`, which
-                // exists only between `enter_live_send` and its
-                // drop), so this is effectively a no-op outside live
-                // mode. Setting `woke_via_live_send_wake` flips on
-                // both `refresh_needed` (so the draw at the bottom
-                // of the loop actually fires) and the
-                // preview-only fast path consideration below.
-                Some(_) = self.live_send_wake_rx.recv() => {
-                    woke_via_live_send_wake = true;
+                _ = async {
+                    match post_key_deadline {
+                        Some(at) => tokio::time::sleep_until(at.into()).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    // Targeted refresh ~15ms after a live-send key,
+                    // catching the agent's echo before the next ticker.
+                    woke_via_post_key = true;
+                    last_live_key_at = None;
                 }
                 _ = async {
                     #[cfg(unix)]
@@ -979,11 +894,10 @@ impl App {
             // Periodic refreshes (only when no input pending).
             //
             // `needs_full_refresh` separately tracks whether anything
-            // OTHER than the live-send wake wants a refresh. The
-            // preview-only fast path (see `draw_preview_only`) is
-            // only safe when nothing else needs the sidebar / status
-            // bar / dialogs re-rendered, so we route to it only when
-            // `woke_via_live_send_wake && !needs_full_refresh`.
+            // other than the live-send ticker/post-key wake wants a
+            // refresh; on those flags the cool-down at the bottom of
+            // the loop is bypassed so deterministic signals (status
+            // updates, dialog ticks) get painted right away.
             let mut refresh_needed = false;
             let mut needs_full_refresh = false;
 
@@ -1043,7 +957,18 @@ impl App {
                 needs_full_refresh = true;
             }
 
-            if last_disk_refresh.elapsed() >= DISK_REFRESH_INTERVAL {
+            // Defer the 5s disk reload while the user is in live-send.
+            // The reload is on the UI thread and rebuilds the sidebar
+            // tree from disk, which causes a visible hitch in the
+            // preview. The user can't change session config from inside
+            // live mode anyway. Leaving `last_disk_refresh` un-advanced
+            // when we skip means the first tick outside live-send
+            // re-checks the interval and reloads immediately if it's
+            // been ≥5s since the last successful reload (so a change
+            // on disk during a long live-send session is picked up on
+            // exit instead of sitting stale for another 5s window).
+            if last_disk_refresh.elapsed() >= DISK_REFRESH_INTERVAL && self.home.live_send.is_none()
+            {
                 self.home.reload()?;
                 last_disk_refresh = std::time::Instant::now();
                 refresh_needed = true;
@@ -1074,43 +999,73 @@ impl App {
                 }
             }
 
-            // Animated spinners (rattles) need periodic redraws, but only at
-            // the spinner frame rate to avoid unnecessary widget tree rebuilds
+            // Animated spinners (rattles) need periodic redraws, but only
+            // at the spinner frame rate to avoid unnecessary widget tree
+            // rebuilds. Skip in live-send: the spinner lives in the
+            // sidebar (which the user isn't looking at) and forcing a
+            // full HomeView render every 120ms inside live mode wakes
+            // the loop eight times a second to repaint a region the
+            // user can't see, which only adds load on top of the
+            // already-busy preview refresh.
             if last_spinner_redraw.elapsed() >= SPINNER_REDRAW_INTERVAL
                 && self.home.has_animated_sessions()
+                && self.home.live_send.is_none()
             {
                 last_spinner_redraw = std::time::Instant::now();
                 refresh_needed = true;
                 needs_full_refresh = true;
             }
 
-            // A live-send wake on its own is a refresh signal: the
-            // agent rendered new bytes into the pane and the preview
-            // is stale. Without this flag the loop would only redraw
-            // when one of the periodic checks above happened to fire,
-            // which is rare in steady-state typing.
-            if woke_via_live_send_wake {
+            // In live-send, the 33ms ticker is the steady-state
+            // refresh source; treat every tick as a refresh. The
+            // post-key wake (`woke_via_post_key`) is the same signal
+            // but on a deterministic ~15ms delay after each keystroke
+            // so typing-echo latency doesn't have to wait for ticker
+            // phase. Outside live-send, only the periodic checks
+            // above trigger refresh.
+            if self.home.live_send.is_some() || woke_via_post_key {
                 refresh_needed = true;
             }
 
+            // Cool-down guard against double-painting in live-send.
+            // The post-key wake and the ticker can fire within 1ms of
+            // each other (key pressed 14ms before a ticker tick: post-
+            // key wake fires at +15ms, ticker tick fires at +16ms),
+            // which doubles up frame writes and produces visible
+            // tearing on terminals without synchronized-update
+            // support. Skip ticker-driven refreshes inside the
+            // cool-down window unless this refresh was specifically
+            // requested by something else (status update, post-key
+            // wake, etc).
+            if refresh_needed
+                && self.home.live_send.is_some()
+                && !woke_via_post_key
+                && !needs_full_refresh
+                && last_refresh_at
+                    .map(|t| t.elapsed() < REFRESH_COOLDOWN)
+                    .unwrap_or(false)
+            {
+                refresh_needed = false;
+            }
+
             if refresh_needed {
-                // `has_dialog()` is true whenever live-send is active, so
-                // using it here would defeat the very fast path it gates.
-                // `has_non_live_send_overlay()` returns true only for
-                // OTHER overlays (settings, diff, dialogs) — those still
-                // need a full draw, but bare live-send doesn't.
-                let prefer_preview_only = woke_via_live_send_wake
-                    && !needs_full_refresh
-                    && self.home.live_send.is_some()
-                    && !self.home.has_non_live_send_overlay()
-                    && self.last_full_frame.is_some();
-                let mut took_fast_path = false;
-                if prefer_preview_only {
-                    took_fast_path = self.draw_preview_only(terminal)?;
-                }
-                if !took_fast_path {
-                    self.draw(terminal)?;
-                }
+                // Always do a full draw in live-send. The
+                // `draw_preview_only` snapshot-painting fast path was
+                // landed in #1495 to cheapen `%output` wakes, but
+                // (a) `%output` wakes no longer exist (control-mode
+                // is gone), and (b) on terminals that don't support
+                // synchronized-update escapes (Apple Terminal.app,
+                // Mosh-with-prediction), the snapshot-then-overlay
+                // pattern produced visible "drag" (the previous
+                // frame's preview cells stayed on screen for a beat
+                // while ratatui's diff caught up). Always-full-draw is
+                // ~2-3ms more CPU per frame (rebuilding the sidebar
+                // widget tree) but is uniformly clean across
+                // terminals. Outside live-send the same path runs
+                // when `refresh_needed`, so this is just collapsing
+                // the conditional branch.
+                self.draw(terminal)?;
+                last_refresh_at = Some(std::time::Instant::now());
             }
 
             if self.should_quit {
@@ -1674,18 +1629,7 @@ impl App {
                     .set_instance_status(&id, crate::session::Status::Starting);
                 self.update_status = Some(UpdateStatus::transient("Reviving session...".into()));
                 self.draw(terminal)?;
-                // Hand the wake-channel sender to ControlModeClient so
-                // the reader thread can break the main loop's idle
-                // sleep on `%output`. `try_send` is the right call
-                // here: the channel is capacity 1, so a pending wake
-                // makes additional `%output` lines drop the send
-                // silently. That's the coalescing we want, the main
-                // loop will see the queued wake on its next iteration.
-                let wake_tx = self.live_send_wake_tx.clone();
-                let on_output_wake: Box<dyn Fn() + Send + 'static> = Box::new(move || {
-                    let _ = wake_tx.try_send(());
-                });
-                let outcome = self.home.enter_live_send(&id, Some(on_output_wake));
+                let outcome = self.home.enter_live_send(&id);
                 match outcome {
                     Ok(Some(sid)) => {
                         self.update_status = Some(UpdateStatus::transient(format!(
@@ -2155,38 +2099,6 @@ pub enum Action {
     /// against the borrowed terminal + event stream.
     #[cfg(feature = "serve")]
     OpenCockpit(String),
-}
-
-/// Widget that paints a previously captured frame into the back
-/// buffer, used by `App::draw_preview_only` to seed the fast-path
-/// frame with the prior full render's cells before re-rendering only
-/// the preview pane. The Widget's `area` argument is intentionally
-/// ignored because we always overwrite the whole back buffer; the
-/// caller is expected to immediately render the preview region on
-/// top to differentiate it from the previous frame's preview cells.
-///
-/// Same-dimension fast path uses `Vec::clone_from_slice` for a
-/// memcpy-shaped copy of all cells. On the off chance dimensions
-/// don't match (snapshot from a different terminal size that wasn't
-/// caught by the caller's resize check), the painter is a no-op and
-/// the fast-path render produces a half-painted frame; the caller's
-/// resize check should make this unreachable in practice.
-struct SnapshotPainter<'a> {
-    snapshot: &'a ratatui::buffer::Buffer,
-}
-
-impl<'a> SnapshotPainter<'a> {
-    fn new(snapshot: &'a ratatui::buffer::Buffer) -> Self {
-        Self { snapshot }
-    }
-}
-
-impl ratatui::widgets::Widget for SnapshotPainter<'_> {
-    fn render(self, _area: ratatui::layout::Rect, buf: &mut ratatui::buffer::Buffer) {
-        if buf.area == self.snapshot.area && buf.content.len() == self.snapshot.content.len() {
-            buf.content.clone_from_slice(&self.snapshot.content);
-        }
-    }
 }
 
 #[cfg(test)]

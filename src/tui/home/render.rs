@@ -62,18 +62,6 @@ fn compose_list_title(
 /// requested scroll.
 const CAPTURE_BUFFER: u16 = 20;
 
-/// How many consecutive `capture_via_control_mode` errors we tolerate
-/// before tearing down the live-send `ControlModeClient` and forcing
-/// the user to exit+re-enter live mode to recover.
-///
-/// Sized to absorb a worker/main mutex-contention storm (fast typing
-/// while the agent is also emitting `%output`) without blanking the
-/// preview, while still bounding how long the user sees stale content
-/// before we give up on a genuinely-dead socket. With the per-command
-/// `RESPONSE_TIMEOUT` set to a few seconds, this works out to roughly
-/// ~10-15 seconds of stale preview on a wedged connection.
-const MAX_LIVE_CAPTURE_FAILURES: u32 = 5;
-
 /// Trim `text` to fit within `max_width` display cells, appending '…'
 /// if anything was dropped. Used by the live-send banners so a long
 /// session title never pushes the exit-chord hint off-screen on a
@@ -415,36 +403,6 @@ fn activity_column_padding(
 }
 
 impl HomeView {
-    /// Re-render only the preview pane at `preview_area`, leaving
-    /// every other region of the back buffer untouched. Called from
-    /// `App::draw_preview_only` on the live-send `%output` fast path:
-    /// the caller has already painted the previous full frame's
-    /// cells into the back buffer, so anything outside `preview_area`
-    /// matches the prior frame and ratatui's diff produces an empty
-    /// write for that region. Inside `preview_area` we re-run the
-    /// usual capture + Paragraph pipeline so the user's typed input
-    /// (echoed by the agent via `%output`) lands as fast as ratatui
-    /// can diff and write it.
-    ///
-    /// This deliberately mirrors only the Agent ViewMode branch of
-    /// `render_preview`. The fast path is gated by the caller to
-    /// require live-send active, which itself requires
-    /// `ViewMode::Agent`; the Terminal / Tool view modes shouldn't
-    /// reach this code, and live-send doesn't apply to them anyway.
-    pub fn render_preview_pane_only(
-        &mut self,
-        frame: &mut Frame,
-        preview_area: Rect,
-        theme: &Theme,
-    ) {
-        // `render_preview` mutates a bunch of HomeView state
-        // (preview_area, preview_cache, scroll offset clamps). We
-        // want the same mutations on the fast path so the next full
-        // draw sees consistent state; calling render_preview
-        // directly is the simplest way to keep them in sync.
-        self.render_preview(frame, preview_area, theme);
-    }
-
     pub fn render(
         &mut self,
         frame: &mut Frame,
@@ -1297,34 +1255,52 @@ impl HomeView {
         if needs_refresh {
             if let Some(id) = self.selected_session.clone() {
                 let capture_lines = capture_lines_for(height, scroll_offset);
-                // While live-send is active the capture rides the
-                // long-lived `tmux -C` client (same socket the worker
-                // uses for keystrokes). Outside live-send we use the
-                // historical fork-per-refresh path, which only runs
-                // at the 250ms idle cadence so the fork cost is
-                // immaterial.
+                // Captures always go through the fork-based path
+                // (`Session::capture_pane_with_size` via the instance
+                // helper). The long-lived `tmux -C` connection is
+                // reserved for `send-keys` from the worker thread; on
+                // some tmux builds (macOS 3.x observed) the control-
+                // mode connection EOFs mid-session, and routing
+                // captures through it as well meant a dropped
+                // connection froze the preview until the user exited
+                // live mode. Forking per capture costs ~5-10 ms on a
+                // local mac and is invisible against the 250 ms idle
+                // throttle / `%output`-wake cadence; we trade that
+                // overhead for "preview never gets stuck".
                 //
-                // `captured` is `Option<String>`. `Some` means we have
-                // fresh bytes; `None` means a transient failure that the
-                // next refresh will retry — leave the cache alone so the
-                // preview keeps showing the last-known-good content
-                // instead of flashing blank. See `capture_via_control_mode`
-                // for the retry budget that bounds how long we serve
-                // stale content before tearing down a truly-dead client.
-                let captured: Option<String> = if self.live_send.is_some() {
-                    self.capture_via_control_mode(capture_lines)
+                // Live vs. non-live failure semantics differ. In live
+                // mode an empty capture (which is what
+                // `Session::capture_pane_with_size` returns when the
+                // session is gone OR tmux had a transient hiccup)
+                // preserves the last-known-good capture so the preview
+                // doesn't flash blank (the kill-switch behavior
+                // introduced in #1501). Outside live mode the empty
+                // content surfaces as "No output available", which is
+                // the intended signal that the underlying session is
+                // gone.
+                let in_live = self.live_send.is_some();
+                // Only treat an empty fork capture as "preserve the
+                // existing cache" when the cache is FOR THIS SAME
+                // SESSION. If the user just switched live-send from
+                // session A to session B and B's first capture comes
+                // back empty, holding the kill-switch would leave A's
+                // content on screen under B's header. Cross-session
+                // we always overwrite, falling back to an empty body
+                // (the same "session looks gone" signal the non-live
+                // path uses).
+                let same_session = self.preview_cache.session_id.as_ref() == Some(&id);
+                let fork_capture = self.get_instance(&id).and_then(|inst| {
+                    inst.capture_output_with_size(capture_lines, width, height)
+                        .ok()
+                });
+                let captured: Option<String> = if in_live {
+                    match fork_capture {
+                        Some(content) if !content.is_empty() => Some(content),
+                        _ if same_session => None,
+                        _ => Some(String::new()),
+                    }
                 } else {
-                    // Non-live path: treat a missing instance or capture
-                    // error the same as before — empty content is the
-                    // intended signal that the underlying session is gone.
-                    Some(
-                        self.get_instance(&id)
-                            .and_then(|inst| {
-                                inst.capture_output_with_size(capture_lines, width, height)
-                                    .ok()
-                            })
-                            .unwrap_or_default(),
-                    )
+                    Some(fork_capture.unwrap_or_default())
                 };
                 // Only mutate cache when we actually got bytes. On a
                 // live-mode transient failure (`None`) we leave every
@@ -1350,68 +1326,6 @@ impl HomeView {
                         height,
                     );
                 }
-            }
-        }
-    }
-
-    /// Capture the preview through the live-send `tmux -C` client.
-    /// Called only while live-send is active; outside live-send the
-    /// caller uses the historical fork path directly.
-    ///
-    /// Returns `None` when:
-    /// - no client is up (spawn failed earlier; live-send entry
-    ///   should have aborted, so this means we're in a transient
-    ///   teardown state).
-    /// - the client returned an error this call. The caller (see
-    ///   `refresh_preview_cache_if_needed`) reads `None` as "keep
-    ///   the previous cache" so the user sees the last-known-good
-    ///   preview instead of "No output available" on a single
-    ///   transient timeout.
-    ///
-    /// Consecutive failures are counted in
-    /// `live_send_capture_failures`. Once that hits
-    /// `MAX_LIVE_CAPTURE_FAILURES` the client is torn down and
-    /// subsequent calls fall through to the first short-circuit;
-    /// the user then has to exit and re-enter live mode to
-    /// recover, which spawns a fresh `ControlModeClient`. The
-    /// budget is sized so worker/main socket contention plus a
-    /// stray timeout doesn't trip the teardown, but a genuinely
-    /// dead connection still tears down within a few seconds.
-    fn capture_via_control_mode(&mut self, capture_lines: usize) -> Option<String> {
-        let client = self.control_mode_client.as_ref()?;
-        match client.capture_pane(
-            capture_lines,
-            self.preview_cache.dimensions.0,
-            self.preview_cache.dimensions.1,
-        ) {
-            Ok(content) => {
-                // Any success resets the budget. A burst of timeouts
-                // followed by a recovery shouldn't carry the failure
-                // count forward into the next quiet stretch.
-                self.live_send_capture_failures = 0;
-                Some(content)
-            }
-            Err(err) => {
-                self.live_send_capture_failures = self.live_send_capture_failures.saturating_add(1);
-                if self.live_send_capture_failures >= MAX_LIVE_CAPTURE_FAILURES {
-                    tracing::warn!(
-                        target: "tmux.control_mode",
-                        error = %err,
-                        failures = self.live_send_capture_failures,
-                        "control-mode capture failed too many times; tearing down client. \
-                        Exit and re-enter live mode to recover.",
-                    );
-                    self.control_mode_client = None;
-                    self.live_send_capture_failures = 0;
-                } else {
-                    tracing::debug!(
-                        target: "tmux.control_mode",
-                        error = %err,
-                        failures = self.live_send_capture_failures,
-                        "control-mode capture failed; will retry on next refresh",
-                    );
-                }
-                None
             }
         }
     }

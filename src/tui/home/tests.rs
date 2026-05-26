@@ -6280,43 +6280,29 @@ mod live_send_mode {
 
     #[test]
     #[serial]
-    fn capture_failures_counter_starts_at_zero() {
-        // Sanity guard on the field that bounds the kill-switch budget
-        // in `capture_via_control_mode`. If this is mis-initialized, the
-        // first capture failure could trip an immediate teardown.
-        let env = create_test_env_empty();
-        assert_eq!(env.view.live_send_capture_failures, 0);
-    }
-
-    #[test]
-    #[serial]
     fn refresh_preserves_cache_when_live_capture_fails() {
-        // The original bug: a single failed `capture_via_control_mode`
-        // wiped `preview_cache.content` to "" via `.unwrap_or_default()`,
-        // which made the preview render "No output available" (what the
-        // user perceives as "blank") until they exited and re-entered
-        // live mode. This test pins the fixed behavior: when the
-        // control-mode client is unreachable, the previous capture's
-        // content stays in the cache so the user keeps seeing the
-        // last-known-good preview while the next refresh retries.
+        // Pin the kill-switch behavior (originally introduced in #1501,
+        // re-implemented here against the fork-only capture path):
+        // when live-send is active and the capture call fails (in this
+        // unit fixture the backing tmux session doesn't exist, so the
+        // fork returns Err), the previous capture's content must stay
+        // in the cache. Pre-#1501 a single failed capture wiped
+        // `preview_cache.content` to "" and the preview rendered
+        // "No output available" until the user exited and re-entered
+        // live mode.
         let mut env = create_test_env_with_sessions(1);
         let id = install_live_for_first_session(&mut env);
         env.view.selected_session = Some(id.clone());
-        // Seed the cache as if a prior capture had succeeded.
         env.view.preview_cache.content = "hello from a successful capture".to_string();
         env.view.preview_cache.captured_lines = 1;
         env.view.preview_cache.dimensions = (80, 24);
         env.view.preview_cache.session_id = Some(id);
-        // Simulate the kill-switch torn-down state: no client at all.
-        // `capture_via_control_mode` short-circuits to `None`, and the
-        // refresh path must NOT overwrite content with "".
-        env.view.control_mode_client = None;
 
         env.view.refresh_preview_cache_if_needed(80, 24);
 
         assert_eq!(
             env.view.preview_cache.content, "hello from a successful capture",
-            "cache content must be preserved when live-mode capture returns None"
+            "cache must be preserved when the fork capture fails inside live mode"
         );
         assert_eq!(env.view.preview_cache.captured_lines, 1);
     }

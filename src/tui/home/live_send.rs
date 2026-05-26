@@ -21,12 +21,15 @@
 //! - No echo, no inline editing, no review step. The preview pane is the
 //!   only feedback channel; users who need multi-line composition or want
 //!   to proofread voice/dictation should use the compose dialog on `M`.
-//! - Keystrokes ride a long-lived `tmux -C` control-mode connection
-//!   (`crate::tmux::ControlModeClient`), not one fork per send-keys
-//!   call. The connection is shared with the preview-refresh path so
-//!   captures and keystrokes contend for the same socket; in practice
-//!   both round-trips are sub-millisecond on a fast host, well below
-//!   what the user can see.
+//! - Each coalesced keystroke run becomes one `tmux send-keys`
+//!   subprocess. A long-lived `tmux -C` control-mode connection was
+//!   tried (#1485) to avoid that fork cost on mobile, but the
+//!   connection turned out to be unreliable on macOS tmux 3.x: it
+//!   EOF'd within milliseconds of spawn, leaving us paying the spawn
+//!   cost while never benefiting from the connection. Forking per
+//!   batch is the simpler, more portable model; the per-batch fork
+//!   cost is bounded by user typing speed (held keys / pastes
+//!   coalesce into one fork) and is invisible on a laptop.
 //!
 //! Reserved (non-forwarded) chords:
 //! - The configured exit chord list — exits live mode (see above).
@@ -38,7 +41,6 @@
 //!   handled by `handle_scroll_up` / `handle_scroll_down`.
 
 use std::sync::mpsc::{channel, Sender};
-use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -325,48 +327,54 @@ pub(super) enum WorkerMsg {
     Resize { cols: u16, rows: u16 },
 }
 
-/// Background dispatcher: shares a `tmux -C` control-mode connection
-/// with the preview-refresh path and drains a channel of `WorkerMsg`s,
-/// calling `coalesce_batch` to compress runs of literal keys into single
-/// `send-keys` invocations. Spawned on `enter_live_send` and dropped
-/// when the user exits live mode; dropping closes the channel, which
-/// makes the worker thread's `recv` return `Err` and exit on the next
-/// iteration. We deliberately do not `join` because the worker is
+/// Background dispatcher: drains a channel of `WorkerMsg`s and runs
+/// each via a one-shot `tmux send-keys` / `resize-window` subprocess
+/// after coalescing with `coalesce`. Spawned on `enter_live_send` and
+/// dropped when the user exits live mode; dropping closes the channel,
+/// which makes the worker thread's `recv` return `Err` and exit on the
+/// next iteration. We deliberately do not `join` because the worker is
 /// idempotent and harmless if it survives a brief moment past the UI
 /// thread that owned it (e.g., the user toggles live mode rapidly).
 ///
-/// All dispatch goes through the control-mode socket: there is no
-/// fork-based fallback. If the socket dies mid-session, errors are
-/// logged and the work is dropped; the user notices typing stop and
-/// exits live mode, which tears the client down and lets the next
-/// `enter_live_send` spawn a fresh one.
+/// Previously (#1485) this dispatched through a long-lived
+/// `tmux -C attach-session` connection to avoid one fork per
+/// keystroke. The connection turned out to be unstable on at least
+/// some macOS tmux 3.x builds (it would EOF within milliseconds of
+/// spawn), and the resulting fork-fallback path was hit ~100% of the
+/// time on those setups while still paying the spawn cost upfront.
+/// Ripping out control-mode entirely keeps the dispatch path simple
+/// (one fork per coalesced batch) and consistent across setups; the
+/// per-keystroke fork cost is bounded by user typing speed and is
+/// invisible on a laptop. Mobile/mosh users pay a few extra ms per
+/// keypress, which we accept as the cost of reliability.
 pub(in crate::tui) struct LiveSendWorker {
     tx: Sender<WorkerMsg>,
 }
 
 impl LiveSendWorker {
-    pub(super) fn spawn(client: Arc<crate::tmux::ControlModeClient>) -> Self {
+    pub(super) fn spawn(tmux_name: String) -> Self {
         let (tx, rx) = channel::<WorkerMsg>();
         std::thread::spawn(move || {
             // Block until the first message, then drain anything else
-            // that piled up during the previous flush. This is enough
-            // to coalesce paste-bursts and held-key autorepeat without
-            // adding any extra sleep that would inflate single-key
-            // latency.
+            // that piled up during the previous flush. The drain plus
+            // `coalesce` collapses paste-bursts and held-key autorepeat
+            // into one fork per literal run, so typing a long sentence
+            // costs one `tmux send-keys -l` invocation, not one per
+            // character.
             while let Ok(first) = rx.recv() {
                 let mut batch = vec![first];
                 while let Ok(msg) = rx.try_recv() {
                     batch.push(msg);
                 }
-                dispatch_batch(&client, batch);
+                dispatch_batch(&tmux_name, batch);
             }
         });
         Self { tx }
     }
 
     /// Enqueue a translated key for dispatch. Returns immediately; the
-    /// `tmux send-keys` round-trip over the control-mode socket happens
-    /// on the worker thread, so the UI never blocks on tmux latency.
+    /// `tmux send-keys` fork happens on the worker thread, so the UI
+    /// never blocks on tmux latency.
     pub(super) fn send(&self, key: TmuxKey) {
         // Channel send only fails if the worker thread panicked. Drop
         // silently rather than spam logs: the user's next exit attempt
@@ -384,21 +392,61 @@ impl LiveSendWorker {
     }
 }
 
-/// Walk one drained batch and execute it against `client`. Uses
-/// `coalesce` so literal-key runs collapse into a single `send-keys`
-/// call; named keys and resizes dispatch individually. Tests verify
-/// the ordering via `coalesce` directly without needing a real session.
-fn dispatch_batch(client: &crate::tmux::ControlModeClient, batch: Vec<WorkerMsg>) {
+/// Walk one drained batch and execute it as one-shot `tmux` subprocesses.
+/// `coalesce` merges literal-key runs into a single `send-keys -l` call;
+/// named keys and resizes dispatch individually. Tests verify the
+/// coalescing ordering via `coalesce` directly without needing a real
+/// session.
+fn dispatch_batch(tmux_name: &str, batch: Vec<WorkerMsg>) {
     for action in coalesce(batch) {
-        let result = match action {
-            TmuxAction::Literal(s) => client.send_literal_no_enter(&s),
-            TmuxAction::Named(name) => client.send_named_key(&name),
-            TmuxAction::Resize { cols, rows } => client.resize(cols, rows),
-        };
-        if let Err(e) = result {
-            tracing::warn!("live-send worker: control-mode op failed: {}", e);
+        if let Err(err) = dispatch_via_fork(tmux_name, &action) {
+            tracing::warn!(
+                target: "tui.live_send",
+                error = %err,
+                action = ?action,
+                "live-send fork dispatch failed; keystroke dropped",
+            );
         }
     }
+}
+
+/// Execute one `TmuxAction` as a one-shot `tmux` subprocess. Module-
+/// level fn (rather than a method on the worker) so it stays callable
+/// from the spawned thread without holding a worker reference.
+fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction) -> anyhow::Result<()> {
+    use std::process::{Command, Stdio};
+    let target = format!("{}:^.0", tmux_name);
+    let mut cmd = Command::new("tmux");
+    cmd.stderr(Stdio::null());
+    match action {
+        TmuxAction::Literal(s) => {
+            // `-l --` mirrors `send_literal_no_enter`: literal-mode
+            // send, followed by the end-of-options marker so a payload
+            // starting with `-` isn't reparsed as a flag.
+            cmd.args(["send-keys", "-t", &target, "-l", "--", s.as_str()]);
+        }
+        TmuxAction::Named(name) => {
+            cmd.args(["send-keys", "-t", &target, name.as_str()]);
+        }
+        TmuxAction::Resize { cols, rows } => {
+            cmd.args([
+                "resize-window",
+                "-t",
+                tmux_name,
+                "-x",
+                &cols.to_string(),
+                "-y",
+                &rows.to_string(),
+            ]);
+        }
+    }
+    let status = cmd
+        .status()
+        .map_err(|e| anyhow::anyhow!("spawn live-send tmux subprocess: {}", e))?;
+    if !status.success() {
+        anyhow::bail!("live-send tmux subprocess exited non-zero for {:?}", action);
+    }
+    Ok(())
 }
 
 /// What the translator says to do with one incoming key event.
