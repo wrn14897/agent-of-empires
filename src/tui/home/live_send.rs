@@ -411,7 +411,7 @@ pub(in crate::tui) struct LiveSendWorker {
 }
 
 impl LiveSendWorker {
-    pub(super) fn spawn(tmux_name: String) -> Self {
+    pub(super) fn spawn(tmux_name: String, capture_wake: Option<LiveCaptureWake>) -> Self {
         let (tx, rx) = channel::<WorkerMsg>();
         std::thread::spawn(move || {
             // Block until the first message, then drain anything else
@@ -426,6 +426,9 @@ impl LiveSendWorker {
                     batch.push(msg);
                 }
                 dispatch_batch(&tmux_name, batch);
+                if let Some(wake) = &capture_wake {
+                    wake.wake();
+                }
             }
         });
         Self { tx }
@@ -462,20 +465,31 @@ impl LiveSendWorker {
 /// forks, since the render only paints every ~33ms anyway).
 const LIVE_CAPTURE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 
-/// Off-thread preview capture for agent live-send. Spawned alongside
-/// [`LiveSendWorker`] when live-send targets the agent pane, it forks
-/// `tmux capture-pane` on its own thread and publishes fresh pane content
-/// into a single-slot mailbox the render loop drains. The render loop
-/// applies the latest content without forking, which is what moves the
-/// per-frame capture cost (~8.5ms measured on macOS, ~90% of a live-send
-/// frame) off the hot path. Dropping the worker flips `stop` so the
-/// thread exits after its current cycle; like `LiveSendWorker` we don't
-/// join.
-///
-/// Scoped to the agent target on purpose: only the agent preview
-/// force-refreshes every frame in live-send (the terminal/container/tool
-/// previews stay 250ms-throttled), so it's the only path paying the
-/// per-frame fork. Non-agent targets keep the synchronous capture.
+#[derive(Clone)]
+pub(in crate::tui) struct LiveCaptureWake {
+    tx: Sender<()>,
+}
+
+impl LiveCaptureWake {
+    fn wake(&self) {
+        let _ = self.tx.send(());
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::tui) enum EmptyCapturePolicy {
+    PreserveLastGood,
+    ForwardEmpty,
+}
+
+/// Off-thread preview capture for live-send. Spawned alongside
+/// [`LiveSendWorker`] for the targeted tmux pane, it forks
+/// `tmux capture-pane` on its own thread and publishes fresh pane
+/// content into a single-slot mailbox the render loop drains. The render
+/// loop applies the latest content without forking, which moves the
+/// per-frame capture cost off the hot path. Dropping the worker flips
+/// `stop` so the thread exits after its current cycle; like
+/// `LiveSendWorker` we don't join.
 pub(in crate::tui) struct LiveCaptureWorker {
     /// Lines the render loop wants captured (height + scrollback + buffer).
     /// `0` means "not set yet"; the worker skips capturing until the first
@@ -487,21 +501,24 @@ pub(in crate::tui) struct LiveCaptureWorker {
     /// the render thread stalls.
     latest: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    wake_tx: Sender<()>,
 }
 
 impl Drop for LiveCaptureWorker {
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = self.wake_tx.send(());
     }
 }
 
 impl LiveCaptureWorker {
-    pub(in crate::tui) fn spawn(tmux_name: String) -> Self {
+    pub(in crate::tui) fn spawn(tmux_name: String, empty_policy: EmptyCapturePolicy) -> Self {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::{Arc, Mutex};
         let capture_lines = Arc::new(AtomicUsize::new(0));
         let latest: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
+        let (wake_tx, wake_rx) = channel::<()>();
         let lines_cell = capture_lines.clone();
         let slot = latest.clone();
         let stop_flag = stop.clone();
@@ -511,13 +528,17 @@ impl LiveCaptureWorker {
             while !stop_flag.load(Ordering::Relaxed) {
                 let lines = lines_cell.load(Ordering::Relaxed);
                 if lines > 0 {
-                    if let Ok(content) = session.capture_pane(lines) {
-                        // Skip empties (preserve the last-good preview, the
-                        // #1501 kill switch) and unchanged frames (no point
-                        // waking a re-parse). Only changed, non-empty
-                        // captures reach the render loop.
-                        if !content.is_empty() && last_captured.as_deref() != Some(content.as_str())
-                        {
+                    let capture = match session.capture_pane(lines) {
+                        Ok(content) => Some(content),
+                        Err(_) if empty_policy == EmptyCapturePolicy::ForwardEmpty => {
+                            Some(String::new())
+                        }
+                        Err(_) => None,
+                    };
+                    if let Some(content) = capture {
+                        let allow_empty = empty_policy == EmptyCapturePolicy::ForwardEmpty;
+                        let changed = last_captured.as_deref() != Some(content.as_str());
+                        if (allow_empty || !content.is_empty()) && changed {
                             if let Ok(mut guard) = slot.lock() {
                                 *guard = Some(content.clone());
                             }
@@ -525,13 +546,24 @@ impl LiveCaptureWorker {
                         }
                     }
                 }
-                std::thread::sleep(LIVE_CAPTURE_INTERVAL);
+                match wake_rx.recv_timeout(LIVE_CAPTURE_INTERVAL) {
+                    Ok(_) => while wake_rx.try_recv().is_ok() {},
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
             }
         });
         Self {
             capture_lines,
             latest,
             stop,
+            wake_tx,
+        }
+    }
+
+    pub(in crate::tui) fn waker(&self) -> LiveCaptureWake {
+        LiveCaptureWake {
+            tx: self.wake_tx.clone(),
         }
     }
 
@@ -1342,7 +1374,10 @@ mod tests {
     fn live_capture_worker_idle_until_geometry_set() {
         // With no line count published the worker must not capture at all,
         // so nothing crosses the channel. (`capture_lines == 0` guard.)
-        let worker = LiveCaptureWorker::spawn("aoe_test_capture_no_geometry".into());
+        let worker = LiveCaptureWorker::spawn(
+            "aoe_test_capture_no_geometry".into(),
+            EmptyCapturePolicy::PreserveLastGood,
+        );
         std::thread::sleep(std::time::Duration::from_millis(60));
         assert!(
             worker.take_latest().is_none(),
@@ -1356,12 +1391,32 @@ mod tests {
         // strings. Forwarding those would blank the preview, defeating the
         // #1501 kill switch, so the worker must drop them. Deterministic
         // without a real tmux session: a missing pane always reads empty.
-        let worker = LiveCaptureWorker::spawn("aoe_test_capture_missing_session".into());
+        let worker = LiveCaptureWorker::spawn(
+            "aoe_test_capture_missing_session".into(),
+            EmptyCapturePolicy::PreserveLastGood,
+        );
         worker.set_capture_lines(40);
         std::thread::sleep(std::time::Duration::from_millis(80));
         assert!(
             worker.take_latest().is_none(),
             "empty captures must never be forwarded",
+        );
+    }
+
+    #[test]
+    fn live_capture_worker_can_forward_empty_captures() {
+        // Terminal previews treat empty output as meaningful: a missing or
+        // blank pane should clear stale terminal text instead of preserving it.
+        let worker = LiveCaptureWorker::spawn(
+            "aoe_test_capture_forward_empty".into(),
+            EmptyCapturePolicy::ForwardEmpty,
+        );
+        worker.set_capture_lines(40);
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert_eq!(
+            worker.take_latest(),
+            Some(String::new()),
+            "forward-empty policy must surface empty captures",
         );
     }
 }
