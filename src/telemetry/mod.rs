@@ -330,16 +330,9 @@ pub fn spawn_snapshot(snapshot: UsageSnapshot) {
     tokio::spawn(async move { post(&snapshot).await });
 }
 
-/// Send a usage snapshot and await delivery with a hard timeout. Used on
-/// graceful shutdown so the final snapshot has a chance to flush without
-/// risking a hang. Records the fingerprint.
-pub async fn flush_snapshot(snapshot: UsageSnapshot) {
-    record_snapshot_fp(&snapshot);
-    let _ = tokio::time::timeout(SEND_TIMEOUT, post(&snapshot)).await;
-}
-
-/// Like [`flush_snapshot`], for the best-effort snapshot on graceful exit, but
-/// skips the send when the snapshot is identical (ignoring `sent_at`) to the
+/// Send the best-effort snapshot on graceful exit, awaiting delivery with a
+/// hard timeout so the final snapshot can flush without risking a hang, but
+/// skipping the send when the snapshot is identical (ignoring `sent_at`) to the
 /// last one already emitted this run. A boot (or periodic) snapshot followed by
 /// a quit with unchanged session state would otherwise post the same counts
 /// twice within seconds; a snapshot that actually changed still flushes.
