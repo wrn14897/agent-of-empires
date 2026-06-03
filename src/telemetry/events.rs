@@ -16,7 +16,9 @@ use serde::Serialize;
 /// v3 (#1886): added `sessions_by_substrate`, a mutually-exclusive
 /// per-substrate census of live sessions.
 /// v4 (#1931): added `session_pinned` / `session_snoozed` / `session_archived`.
-pub const SCHEMA_VERSION: u32 = 4;
+/// v5 (#1880): replaced the `web_seen` / `cockpit_seen` booleans with the
+/// allowlisted `usage_seen` count map.
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Which surface emitted the event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -115,10 +117,12 @@ pub struct UsageSnapshot {
     /// schema. See `telemetry::features`.
     pub features: BTreeMap<String, bool>,
 
-    /// The web dashboard was opened at least once since the last snapshot.
-    pub web_seen: bool,
-    /// The cockpit web UI was opened at least once since the last snapshot.
-    pub cockpit_seen: bool,
+    /// Window-scoped usage activity: allowlisted signal name -> times the
+    /// surface was opened since the last snapshot. Keyed by the fixed registry
+    /// in [`super::usage_signals`]; instrumenting a new surface is one registry
+    /// entry, not a schema field. Zero-valued keys stay present so the wire key
+    /// set is stable. See `telemetry::usage_signals`.
+    pub usage_seen: BTreeMap<String, u32>,
 
     /// Sessions created since the previous snapshot (a trend counter, not a
     /// per-session event stream).

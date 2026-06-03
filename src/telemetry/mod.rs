@@ -22,6 +22,7 @@ pub mod events;
 pub mod features;
 pub mod sanitize;
 mod state;
+pub mod usage_signals;
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -345,8 +346,7 @@ fn aggregate_instances(instances: &[Instance]) -> InstanceMetrics {
 pub fn build_usage_snapshot(
     surface: Surface,
     instances: &[Instance],
-    web_seen: bool,
-    cockpit_seen: bool,
+    usage_seen: BTreeMap<String, u32>,
     session_creates_since_last_snapshot: u32,
     auth_mode: Option<&str>,
     serve_mode: Option<&str>,
@@ -378,8 +378,7 @@ pub fn build_usage_snapshot(
         install_id,
         &config,
         instances,
-        web_seen,
-        cockpit_seen,
+        usage_seen,
         session_creates_since_last_snapshot,
     );
     // Layer the serve-only deployment metadata on top of the pure snapshot, so
@@ -398,8 +397,7 @@ fn assemble_usage_snapshot(
     install_id: String,
     config: &crate::session::Config,
     instances: &[Instance],
-    web_seen: bool,
-    cockpit_seen: bool,
+    usage_seen: BTreeMap<String, u32>,
     session_creates_since_last_snapshot: u32,
 ) -> UsageSnapshot {
     let features = features::active_features(config);
@@ -429,8 +427,7 @@ fn assemble_usage_snapshot(
         sessions_by_model_bucket: metrics.by_model_bucket,
         sessions_by_substrate: metrics.by_substrate,
         features,
-        web_seen,
-        cockpit_seen,
+        usage_seen,
         session_creates_since_last_snapshot,
         // Set by `build_usage_snapshot` for the serve surface; the pure
         // assembler leaves them unset.
@@ -585,7 +582,7 @@ fn snapshot_matches_last(snapshot: &UsageSnapshot) -> bool {
 }
 
 /// Outcome of a snapshot flush, so a caller can decide whether to consume the
-/// state the snapshot reported (e.g. reset `web_seen` / a create counter).
+/// state the snapshot reported (e.g. the `usage_seen` counts / a create counter).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendOutcome {
     /// Delivery was confirmed (a 2xx). Safe to consume the reported state.
@@ -704,8 +701,7 @@ mod tests {
             sessions_by_model_bucket: BTreeMap::new(),
             sessions_by_substrate: SUBSTRATES.iter().map(|s| (s.to_string(), 0)).collect(),
             features: BTreeMap::new(),
-            web_seen: false,
-            cockpit_seen: false,
+            usage_seen: usage_signals::zeroed(),
             session_creates_since_last_snapshot: 0,
             auth_mode: None,
             serve_mode: None,
@@ -778,7 +774,15 @@ mod tests {
         let mut pinned = Instance::new("pin", "/tmp/p");
         pinned.pin();
         assert!(
-            build_usage_snapshot(Surface::Tui, &[pinned], false, false, 0, None, None).is_none(),
+            build_usage_snapshot(
+                Surface::Tui,
+                &[pinned],
+                usage_signals::zeroed(),
+                0,
+                None,
+                None
+            )
+            .is_none(),
             "opted-out install must not build a snapshot"
         );
         unsafe { std::env::remove_var("DO_NOT_TRACK") };
@@ -888,8 +892,7 @@ mod tests {
             "test-install-id".to_string(),
             &config,
             std::slice::from_ref(&inst),
-            false,
-            false,
+            usage_signals::zeroed(),
             3,
         );
 

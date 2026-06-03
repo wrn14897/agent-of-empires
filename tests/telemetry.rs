@@ -8,6 +8,7 @@
 use agent_of_empires::session::{
     save_config, Config, Instance, SandboxInfo, WorkspaceInfo, WorktreeInfo,
 };
+use agent_of_empires::telemetry::usage_signals::{self, UsageSeenCounters, USAGE_SIGNALS};
 use agent_of_empires::telemetry::{self, Surface};
 use chrono::Utc;
 use serial_test::serial;
@@ -43,9 +44,15 @@ fn default_off_emits_nothing() {
     assert!(!telemetry::is_opted_in());
     assert_eq!(telemetry::install_id(), None);
     assert!(telemetry::build_process_start(Surface::Cli).is_none());
-    assert!(
-        telemetry::build_usage_snapshot(Surface::Tui, &[], false, false, 0, None, None).is_none()
-    );
+    assert!(telemetry::build_usage_snapshot(
+        Surface::Tui,
+        &[],
+        usage_signals::zeroed(),
+        0,
+        None,
+        None
+    )
+    .is_none());
 }
 
 /// Opting in generates an install id and lets events build; opting back out
@@ -111,8 +118,7 @@ fn snapshot_buckets_are_sanitized() {
     let snapshot = telemetry::build_usage_snapshot(
         Surface::Tui,
         &[custom, claude],
-        false,
-        false,
+        usage_signals::zeroed(),
         0,
         None,
         None,
@@ -198,8 +204,7 @@ fn substrate_census_counts_each_bucket() {
     let snapshot = telemetry::build_usage_snapshot(
         Surface::Tui,
         &[local, worktree, sandbox],
-        false,
-        false,
+        usage_signals::zeroed(),
         0,
         None,
         None,
@@ -237,9 +242,15 @@ fn substrate_buckets_are_mutually_exclusive_and_sum_to_total() {
 
     let instances = [conflicted, sandboxed_worktree, workspace, local];
     let total = instances.len() as u32;
-    let snapshot =
-        telemetry::build_usage_snapshot(Surface::Tui, &instances, false, false, 0, None, None)
-            .expect("snapshot built when opted in");
+    let snapshot = telemetry::build_usage_snapshot(
+        Surface::Tui,
+        &instances,
+        usage_signals::zeroed(),
+        0,
+        None,
+        None,
+    )
+    .expect("snapshot built when opted in");
 
     let sum: u32 = snapshot.sessions_by_substrate.values().sum();
     assert_eq!(
@@ -273,9 +284,15 @@ fn substrate_keys_are_only_allowlisted_vocab() {
         ),
         with_workspace(Instance::new("b", "/home/me/secret-workspace")),
     ];
-    let snapshot =
-        telemetry::build_usage_snapshot(Surface::Serve, &instances, false, false, 0, None, None)
-            .expect("snapshot built when opted in");
+    let snapshot = telemetry::build_usage_snapshot(
+        Surface::Serve,
+        &instances,
+        usage_signals::zeroed(),
+        0,
+        None,
+        None,
+    )
+    .expect("snapshot built when opted in");
 
     for key in snapshot.sessions_by_substrate.keys() {
         assert!(
@@ -300,13 +317,105 @@ fn snapshot_carries_session_create_count() {
     set_enabled(true);
     telemetry::apply_opt_in_change(true);
 
-    let none = telemetry::build_usage_snapshot(Surface::Serve, &[], false, false, 0, None, None)
-        .expect("snapshot built when opted in");
+    let none = telemetry::build_usage_snapshot(
+        Surface::Serve,
+        &[],
+        usage_signals::zeroed(),
+        0,
+        None,
+        None,
+    )
+    .expect("snapshot built when opted in");
     assert_eq!(none.session_creates_since_last_snapshot, 0);
 
-    let some = telemetry::build_usage_snapshot(Surface::Serve, &[], false, false, 7, None, None)
-        .expect("snapshot built when opted in");
+    let some = telemetry::build_usage_snapshot(
+        Surface::Serve,
+        &[],
+        usage_signals::zeroed(),
+        7,
+        None,
+        None,
+    )
+    .expect("snapshot built when opted in");
     assert_eq!(some.session_creates_since_last_snapshot, 7);
+}
+
+/// User story (#1880): a usage signal registered in the allowlist flows through
+/// the daemon aggregate (`UsageSeenCounters`) into the snapshot's `usage_seen`
+/// map with no other code changes. The map carries the recorded counts verbatim.
+#[test]
+#[serial]
+fn snapshot_carries_registered_usage_signals() {
+    let _tmp = isolate();
+    set_enabled(true);
+    telemetry::apply_opt_in_change(true);
+
+    // The daemon folds browser pings into these counters.
+    let counters = UsageSeenCounters::new();
+    assert!(counters.record("web"));
+    assert!(counters.record("web"));
+    assert!(counters.record("cockpit"));
+
+    let snapshot =
+        telemetry::build_usage_snapshot(Surface::Serve, &[], counters.snapshot(), 0, None, None)
+            .expect("snapshot built when opted in");
+    assert_eq!(snapshot.usage_seen.get("web"), Some(&2));
+    assert_eq!(snapshot.usage_seen.get("cockpit"), Some(&1));
+}
+
+/// User story (#1880): an unregistered signal name is rejected by the registry
+/// (`record` returns false, which the endpoint turns into a 400) and never
+/// reaches the snapshot's `usage_seen` map.
+#[test]
+#[serial]
+fn unregistered_usage_signal_is_rejected_and_never_reported() {
+    let _tmp = isolate();
+    set_enabled(true);
+    telemetry::apply_opt_in_change(true);
+
+    let counters = UsageSeenCounters::new();
+    // The endpoint would return 400 on this false.
+    assert!(!counters.record("web_terminal"));
+
+    let snapshot =
+        telemetry::build_usage_snapshot(Surface::Serve, &[], counters.snapshot(), 0, None, None)
+            .expect("snapshot built when opted in");
+    assert!(!snapshot.usage_seen.contains_key("web_terminal"));
+}
+
+/// User story (#1880): the `usage_seen` map only ever carries allowlisted short
+/// names, never free-form input. Its key set is exactly the fixed registry and
+/// every key is a short identifier.
+#[test]
+#[serial]
+fn usage_seen_keys_are_only_allowlisted_short_names() {
+    let _tmp = isolate();
+    set_enabled(true);
+    telemetry::apply_opt_in_change(true);
+
+    let snapshot = telemetry::build_usage_snapshot(
+        Surface::Serve,
+        &[],
+        usage_signals::zeroed(),
+        0,
+        None,
+        None,
+    )
+    .expect("snapshot built when opted in");
+
+    // `usage_seen` is a BTreeMap, so its keys come out sorted; compare against
+    // the registry sorted the same way rather than relying on its source order.
+    let keys: Vec<&str> = snapshot.usage_seen.keys().map(String::as_str).collect();
+    let mut expected: Vec<&str> = USAGE_SIGNALS.to_vec();
+    expected.sort_unstable();
+    assert_eq!(keys, expected);
+    for key in snapshot.usage_seen.keys() {
+        assert!(
+            key.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+            "usage_seen key `{key}` is not a short allowlisted identifier"
+        );
+    }
 }
 
 /// User stories (#1885): the serve snapshot carries the coarse deployment mode.
@@ -325,8 +434,7 @@ fn serve_snapshot_carries_coarse_deployment_mode() {
     let tailscale = telemetry::build_usage_snapshot(
         Surface::Serve,
         &[],
-        false,
-        false,
+        usage_signals::zeroed(),
         0,
         Some("passphrase"),
         Some("tailscale"),
@@ -338,8 +446,7 @@ fn serve_snapshot_carries_coarse_deployment_mode() {
     let local = telemetry::build_usage_snapshot(
         Surface::Serve,
         &[],
-        false,
-        false,
+        usage_signals::zeroed(),
         0,
         Some("token"),
         Some("local"),
@@ -364,8 +471,7 @@ fn opted_out_serve_builds_no_snapshot_with_deployment_mode() {
     assert!(telemetry::build_usage_snapshot(
         Surface::Serve,
         &[],
-        false,
-        false,
+        usage_signals::zeroed(),
         0,
         Some("none"),
         Some("tunnel"),
