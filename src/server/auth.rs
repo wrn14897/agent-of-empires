@@ -1561,6 +1561,7 @@ mod tests {
         assert!(!requires_elevation(&Method::POST, "/api/git/clone"));
         assert!(!requires_elevation(&Method::POST, "/api/projects"));
         assert!(!requires_elevation(&Method::DELETE, "/api/projects/myproj"));
+        assert!(!requires_elevation(&Method::PATCH, "/api/projects/myproj"));
         assert!(!requires_elevation(&Method::POST, "/api/push/subscribe"));
         assert!(!requires_elevation(&Method::POST, "/api/push/unsubscribe"));
         // Cosmetic UI state: marking the web tour seen flips one bool and

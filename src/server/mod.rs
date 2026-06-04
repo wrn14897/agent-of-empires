@@ -1230,7 +1230,10 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/projects",
             get(api::list_projects).post(api::create_project),
         )
-        .route("/api/projects/{name}", delete(api::delete_project))
+        .route(
+            "/api/projects/{name}",
+            patch(api::update_project).delete(api::delete_project),
+        )
         .route("/api/docker/status", get(api::docker_status))
         // Settings + themes
         .route(
