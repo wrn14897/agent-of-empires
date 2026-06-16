@@ -7,6 +7,7 @@ import { clearDraft, sweepOrphanDrafts } from "./lib/acpDrafts";
 import { AcpPrefsProvider } from "./lib/acpPrefs";
 import { safeGetItem, safeRemoveItem, safeSetItem } from "./lib/safeStorage";
 import { useWorkspaces } from "./hooks/useWorkspaces";
+import { useLastSessionRestore } from "./hooks/useLastSessionRestore";
 import { useRepoGroups } from "./hooks/useRepoGroups";
 import { useSessionGroups } from "./hooks/useSessionGroups";
 import { useNestedSidebarGroups } from "./hooks/useNestedSidebarGroups";
@@ -239,6 +240,9 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     setSessionStatus,
   } = useSessions();
   const workspaces = useWorkspaces(sessions);
+
+  // Remember the active session and restore it on a PWA relaunch (#2103).
+  useLastSessionRestore({ activeSessionId, sessions, sessionsLoaded });
 
   // One-shot orphan-draft sweep once useSessions has settled its first
   // fetch (success or null). Catches acp:draft:<id> keys left behind
