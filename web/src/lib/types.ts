@@ -338,6 +338,9 @@ export interface AgentInfo {
    *  The wizard reads this to decide whether a new session runs in
    *  acp or tmux, replacing the hardcoded client-side tool list. */
   acp_capable: boolean;
+  /** True when the agent's ACP adapter binary is actually resolvable on the
+   *  host (not just registered). The import tab gates on this for claude. */
+  acp_installed: boolean;
   /** The ACP command a built-in agent launches in acp (e.g.
    *  `claude-agent-acp`, `opencode`), post `${aoe_data_dir}`
    *  substitution. Can differ from `binary`. Absent for custom agents,
@@ -458,6 +461,20 @@ export interface CreateSessionRequest {
    *  unset, the server returns a `hooks_need_trust` 403; the wizard then
    *  prompts and resubmits with this set to true. */
   trust_hooks?: boolean;
+  /** Import an existing Claude Code session: the on-disk session id to
+   *  resume via `session/load`. Forces the structured view; `path` must be
+   *  the session's original cwd. See #2276. */
+  import_acp_session_id?: string;
+}
+
+/** A discoverable existing Claude Code session on disk, returned by
+ *  `GET /api/claude-sessions` for the import picker. See #2276. */
+export interface ClaudeSessionSummary {
+  session_id: string;
+  cwd: string;
+  title: string | null;
+  last_modified_ms: number;
+  cwd_exists: boolean;
 }
 
 /** Live acp worker lifecycle, mirrored from

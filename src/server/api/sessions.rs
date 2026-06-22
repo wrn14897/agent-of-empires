@@ -3060,6 +3060,14 @@ pub struct CreateSessionBody {
     /// `trust_hooks: true`. Already-trusted hooks run regardless.
     #[serde(default)]
     pub trust_hooks: Option<bool>,
+    /// Import an existing Claude Code session: the on-disk session id (the
+    /// `<sessionId>.jsonl` stem) to resume via `session/load`. When set, the
+    /// new session adopts this id as its `acp_session_id`, is forced to the
+    /// structured view, and seeds its transcript from the agent's history
+    /// replay. `path` must be the session's original cwd. See #2276.
+    #[cfg(feature = "serve")]
+    #[serde(default)]
+    pub import_acp_session_id: Option<String>,
 }
 
 fn validate_session_tool_identity(
@@ -3457,6 +3465,54 @@ pub async fn create_session(
             .into_response();
     }
 
+    // Importing an existing Claude session (#2276) is tightly scoped: it
+    // resumes a specific on-disk session id in its original cwd via the claude
+    // structured agent. Reject any request that pairs the id with a different
+    // workspace shape, a non-claude agent, or a cwd the id doesn't belong to,
+    // so a stale or hand-written request can't seed the transcript in the
+    // wrong place. Runs after tool-identity validation so it sits ahead of
+    // the build's spawn_blocking but behind the agent check.
+    #[cfg(feature = "serve")]
+    if let Some(import_id) = body
+        .import_acp_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let bad = |msg: &str| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "validation_failed", "message": msg})),
+            )
+                .into_response()
+        };
+        if body.tool != "claude"
+            || body
+                .agent_name
+                .as_deref()
+                .is_some_and(|n| !n.trim().is_empty())
+        {
+            return bad("Importing a Claude session requires the built-in claude agent");
+        }
+        if body.scratch || body.worktree_branch.is_some() || !body.extra_repo_paths.is_empty() {
+            return bad(
+                "Importing a Claude session cannot use scratch, a worktree, or extra repos",
+            );
+        }
+        let import_cwd = body.path.trim().to_string();
+        let import_id_owned = import_id.to_string();
+        let belongs = tokio::task::spawn_blocking(move || {
+            crate::acp::claude_import::scan_sessions()
+                .into_iter()
+                .any(|s| s.session_id == import_id_owned && s.cwd == import_cwd)
+        })
+        .await
+        .unwrap_or(false);
+        if !belongs {
+            return bad("Unknown Claude session for this directory");
+        }
+    }
+
     let profile = body.profile.unwrap_or_else(|| state.profile.clone());
     let instances = state.instances.read().await;
     let existing_titles: Vec<String> = instances.iter().map(|i| i.title.clone()).collect();
@@ -3567,6 +3623,20 @@ pub async fn create_session(
         #[cfg(feature = "serve")]
         let agent_effort = {
             instance.view = body.view;
+            // #2276: importing an existing Claude session forces the
+            // structured view and adopts the on-disk session id, so the
+            // structured spawn resumes it via session/load and seeds the
+            // transcript from the agent's history replay. `path` is the
+            // session's original cwd (the wizard prefills it).
+            if let Some(import_id) = body
+                .import_acp_session_id
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+            {
+                instance.view = crate::session::View::Structured;
+                instance.acp_session_id = Some(import_id);
+                instance.import_pending = Some(true);
+            }
             instance.agent_name = body.agent_name;
             let agent_key = instance
                 .agent_name
@@ -3742,6 +3812,7 @@ pub async fn create_session(
                     instance.source_profile.clone(),
                     instance.yolo_mode,
                     instance.command.clone(),
+                    instance.import_pending == Some(true),
                 ))
             } else {
                 None
@@ -3768,6 +3839,7 @@ pub async fn create_session(
                 source_profile,
                 yolo_mode,
                 command,
+                seed_history_replay,
             )) = acp_spawn_target
             {
                 let agent = state
@@ -3821,6 +3893,7 @@ pub async fn create_session(
                             source_profile: source_profile_for_spawn,
                             yolo_mode,
                             agent_command_override: command_override,
+                            seed_history_replay,
                         })
                         .await
                     {

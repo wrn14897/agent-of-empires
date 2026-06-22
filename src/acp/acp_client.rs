@@ -321,6 +321,12 @@ pub struct SpawnConfig {
     /// advertise) happens later, against the `initialize` response. Empty when
     /// no config file exists, which preserves pre-feature behavior.
     pub mcp_servers: Vec<McpServer>,
+    /// When true and this spawn resumes via `session/load`, seed the event
+    /// store from the agent's history replay instead of suppressing it.
+    /// Set for the first spawn of an imported Claude session whose store is
+    /// empty; false for normal reattach (the transcript is already stored,
+    /// so re-ingesting would duplicate-key panic). See #2276.
+    pub seed_history_replay: bool,
 }
 
 /// Commands sent from `AcpClient` methods to the background connection task.
@@ -377,6 +383,10 @@ enum ClientCmd {
 enum ConnectMode {
     Fresh {
         stored_acp_session_id: Option<String>,
+        /// Seed the event store from the `session/load` history replay
+        /// instead of suppressing it (imported session, empty store). See
+        /// #2276.
+        seed_history_replay: bool,
     },
     Resume {
         acp_session_id: String,
@@ -1497,6 +1507,7 @@ impl AcpClient {
         //    a real `aoe` binary, and as a safety valve.
         let mode = ConnectMode::Fresh {
             stored_acp_session_id: config.stored_acp_session_id.clone(),
+            seed_history_replay: config.seed_history_replay,
         };
         let sandbox_pair = if let Some(info) = &config.sandbox_info {
             Some(SessionSandbox::from_info(
@@ -3270,6 +3281,19 @@ fn map_update_to_events(
             }
             other => vec![raw_event(&other)],
         },
+        // Replayed user turns (#2276): claude-agent-acp re-emits each prior
+        // user message as a user_message_chunk during session/load. Live user
+        // prompts are recorded by the send_prompt path as UserPromptSent, so
+        // this only fires on replay; mapping it to UserPromptSent makes the
+        // imported transcript show the user's bubbles. On a normal reattach
+        // these are suppressed (already in the store) by is_transcript_event.
+        SessionUpdate::UserMessageChunk(chunk) => match chunk.content {
+            ContentBlock::Text(text) => vec![Event::UserPromptSent {
+                text: text.text,
+                attachments: Vec::new(),
+            }],
+            other => vec![raw_event(&other)],
+        },
         SessionUpdate::AgentThoughtChunk(_) => vec![Event::ThinkingStarted],
         SessionUpdate::ToolCall(tc) => {
             let raw_args = tc.raw_input.clone().unwrap_or(serde_json::Value::Null);
@@ -4677,6 +4701,21 @@ async fn run_connection_task<W, R>(
                 "initialize handshake complete"
             );
 
+            // Signal handshake-ready now: the ACP `initialize` handshake (what
+            // the spawn timeout actually bounds) is done. session/new and
+            // session/load run below and stream their results as events; for a
+            // resumed/imported session the adapter replays the whole transcript
+            // before answering session/load, which can take far longer than the
+            // handshake timeout. Firing ready here keeps that replay out of the
+            // timeout window (the events still reach the UI as they arrive), so
+            // importing or resuming a large conversation no longer times out
+            // and gets the worker killed. A later session/new failure surfaces
+            // as an AgentStartupError event instead of a spawn() error. See
+            // #2276.
+            if let Some(tx) = ready_for_block.lock().await.take() {
+                let _ = tx.send(Ok(()));
+            }
+
             // Track the mode channels the agent advertised so we can skip
             // session/set_mode requests for modes the agent doesn't support.
             // When new_session.modes is present, only those IDs are valid.
@@ -4741,6 +4780,7 @@ async fn run_connection_task<W, R>(
                 }
                 ConnectMode::Fresh {
                     stored_acp_session_id,
+                    seed_history_replay,
                 } => {
                     // Decide whether to resume the prior agent session or create
                     // a fresh one. session/load is only attempted when the agent
@@ -4766,7 +4806,16 @@ async fn run_connection_task<W, R>(
                             // next reload (assistant-ui then panics with "Duplicate
                             // key toolCallId-..."). Cleared on Err below if we fall
                             // back to session/new, which has no replay payload.
-                            suppress_for_block.store(true, Ordering::Relaxed);
+                            //
+                            // Exception: an imported session (#2276) has an empty
+                            // event store, so we WANT the replay to populate it and
+                            // render the transcript. No existing rows means no
+                            // duplicate-key risk. The server clears import_pending
+                            // once this load lands, so a later reattach suppresses
+                            // normally.
+                            if !seed_history_replay {
+                                suppress_for_block.store(true, Ordering::Relaxed);
+                            }
                             let req = LoadSessionRequest::new(stored.clone(), cwd.clone())
                                 .mcp_servers(mcp_servers.clone());
                             match connection.send_request(req).block_task().await {
@@ -4826,6 +4875,25 @@ async fn run_connection_task<W, R>(
                                         let _ = event_tx_for_block.send(event).await;
                                     }
                                     acp_session_id = Some(SessionId::from(stored));
+                                }
+                                Err(e) if seed_history_replay => {
+                                    // Import seed (#2276): the replay may have
+                                    // partially populated the (otherwise empty)
+                                    // event store before load failed. Falling
+                                    // back to session/new would leave a fresh
+                                    // session inheriting that partial external
+                                    // transcript, so fail the import instead.
+                                    // import_pending stays set (no
+                                    // AcpSessionAssigned), and the next spawn
+                                    // clears the store and re-seeds before
+                                    // retrying.
+                                    warn!(
+                                        target: "acp.protocol",
+                                        session = %session_label,
+                                        stored_id = %stored,
+                                        "session/load failed for imported session; failing import (no session/new fallback): {e}"
+                                    );
+                                    return Err(e);
                                 }
                                 Err(e) => {
                                     warn!(
@@ -4981,10 +5049,6 @@ async fn run_connection_task<W, R>(
                     }
                 }
             };
-
-            if let Some(tx) = ready_for_block.lock().await.take() {
-                let _ = tx.send(Ok(()));
-            }
 
             // Arm the resume-idle watchdog. The agent's response to the
             // orphaned in-flight `session/prompt` (from the previous
@@ -7392,6 +7456,7 @@ mod tests {
             default_effort: None,
             socket_path: None,
             stored_acp_session_id: None,
+            seed_history_replay: false,
             sandbox_info: Some(sandbox.clone()),
             source_profile: None,
             mcp_servers: Vec::new(),
@@ -7460,6 +7525,7 @@ mod tests {
             default_effort: None,
             socket_path: None,
             stored_acp_session_id: None,
+            seed_history_replay: false,
             sandbox_info: Some(sandbox.clone()),
             source_profile: None,
             mcp_servers: Vec::new(),
@@ -7530,6 +7596,7 @@ mod tests {
             default_effort: None,
             socket_path: None,
             stored_acp_session_id: None,
+            seed_history_replay: false,
             sandbox_info: Some(sandbox.clone()),
             source_profile: None,
             mcp_servers: Vec::new(),
@@ -7576,6 +7643,7 @@ mod tests {
             default_effort: None,
             socket_path: None,
             stored_acp_session_id: None,
+            seed_history_replay: false,
             sandbox_info: None,
             source_profile: None,
             mcp_servers: Vec::new(),
@@ -7608,6 +7676,7 @@ mod tests {
             default_effort: None,
             socket_path: None,
             stored_acp_session_id: None,
+            seed_history_replay: false,
             sandbox_info: None,
             source_profile: None,
             mcp_servers: Vec::new(),
@@ -8492,6 +8561,27 @@ mod tests {
                 assert_eq!(content, "abc1234 first commit");
             }
             other => panic!("expected ToolCallCompleted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_user_message_chunk_becomes_user_prompt_sent() {
+        // Imported sessions replay prior user turns as user_message_chunk
+        // (#2276); they must map to UserPromptSent so the user's bubbles
+        // render, not get dropped to a raw event.
+        use agent_client_protocol::schema::{ContentBlock, ContentChunk, TextContent};
+        let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new("hello from the past")));
+        let events = map_update_to_events(
+            SessionUpdate::UserMessageChunk(chunk),
+            &agent_profiles::CLAUDE,
+        );
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Event::UserPromptSent { text, attachments } => {
+                assert_eq!(text, "hello from the past");
+                assert!(attachments.is_empty());
+            }
+            other => panic!("expected UserPromptSent, got {other:?}"),
         }
     }
 

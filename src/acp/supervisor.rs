@@ -181,6 +181,12 @@ pub trait BroadcastSink: Send + Sync + 'static {
         self.publish(session_id, seq, event);
         true
     }
+    /// Drop all stored events for a session. Used by the import path to clear
+    /// any partial replay from a prior failed attempt before re-seeding, run
+    /// only after the worker slot is reserved so a duplicate spawn that hits
+    /// `AlreadyRunning` can't wipe a live worker's transcript. Default no-op
+    /// for test sinks without an event store. See #2276.
+    fn clear_session_events(&self, _session_id: &str) {}
     /// Approval nonces from `ApprovalRequested` events on disk with no
     /// matching `ApprovalResolved`. Used by `Supervisor::attach` to
     /// cancel approvals whose responder died with the previous daemon.
@@ -496,6 +502,13 @@ pub struct SpawnRequest {
     /// tool's built-in binary (see `apply_agent_command_override`).
     /// See #1766.
     pub agent_command_override: Option<AgentCommandOverride>,
+    /// When true and this is a `session/load` spawn, do NOT suppress the
+    /// agent's history replay; let it populate the (empty) event store so
+    /// an imported transcript renders. Normal reattach leaves this false so
+    /// the replay is suppressed against the already-stored transcript,
+    /// avoiding a duplicate-key panic. The caller computes it from the
+    /// session's `import_pending` flag. See #2276.
+    pub seed_history_replay: bool,
 }
 
 /// True when `command` names the same executable as `binary`, comparing
@@ -1287,6 +1300,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             source_profile,
             yolo_mode,
             agent_command_override,
+            seed_history_replay,
         } = req;
 
         // Per-agent install gate. claude-agent-acp lazy-installs its
@@ -1405,6 +1419,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             sandbox_info,
             source_profile,
             mcp_servers,
+            seed_history_replay,
         };
 
         debug!(
@@ -1413,6 +1428,15 @@ impl<S: BroadcastSink> Supervisor<S> {
             stored_id = ?stored_acp_session_id,
             "spawning structured view worker"
         );
+
+        // Import seeding: clear any partial replay from a prior failed attempt
+        // before session/load re-emits the transcript. Done here, after the
+        // spawn reservation is held, rather than in the REST handler, so a
+        // duplicate import spawn that bails with AlreadyRunning can't wipe a
+        // live worker's stored transcript. See #2276.
+        if seed_history_replay {
+            self.sink.clear_session_events(&session_id);
+        }
 
         let acp_session_id = AcpSessionId(session_id.clone());
         let mut client = match AcpClient::spawn(config.clone(), acp_session_id.clone()).await {
@@ -1607,6 +1631,14 @@ impl<S: BroadcastSink> Supervisor<S> {
                                         );
                                         spawn_config.stored_acp_session_id =
                                             Some(acp_session_id.clone());
+                                        // Import replay is one-shot: only the
+                                        // first successful session/load needs
+                                        // it. Clear it so an automatic respawn
+                                        // (crash/drain) suppresses replay against
+                                        // the now-populated event store instead
+                                        // of duplicating the transcript. See
+                                        // #2276.
+                                        spawn_config.seed_history_replay = false;
                                     }
                                 }
                                 // Mirror into the on-disk registry so a fresh
@@ -2857,6 +2889,10 @@ impl BroadcastSink for ChannelSink {
         let _ = self.publish_persisted(session_id, seq, event);
     }
 
+    fn clear_session_events(&self, session_id: &str) {
+        self.event_store.delete_session(session_id);
+    }
+
     fn publish_persisted(&self, session_id: &str, seq: u64, event: &Event) -> bool {
         // Persist FIRST so a disk failure can be surfaced before
         // broadcast subscribers see an event the on-disk log doesn't
@@ -3090,6 +3126,7 @@ mod tests {
                 model: None,
                 effort: None,
                 stored_acp_session_id: None,
+                seed_history_replay: false,
                 sandbox_info: None,
                 source_profile: None,
                 yolo_mode: false,
@@ -3130,6 +3167,7 @@ mod tests {
                 model: None,
                 effort: None,
                 stored_acp_session_id: None,
+                seed_history_replay: false,
                 sandbox_info: None,
                 source_profile: None,
                 yolo_mode: false,
@@ -3345,6 +3383,7 @@ mod tests {
             default_effort: None,
             socket_path: Some(socket_path.clone()),
             stored_acp_session_id: None,
+            seed_history_replay: false,
             sandbox_info: None,
             source_profile: None,
             mcp_servers: Vec::new(),
@@ -3436,6 +3475,7 @@ mod tests {
             default_effort: None,
             socket_path: Some(tmp.path().join("dummy.sock")),
             stored_acp_session_id: None,
+            seed_history_replay: false,
             sandbox_info: None,
             source_profile: None,
             mcp_servers: Vec::new(),
@@ -3510,6 +3550,7 @@ mod tests {
             default_effort: None,
             socket_path: Some(tmp.path().join("dummy.sock")),
             stored_acp_session_id: None,
+            seed_history_replay: false,
             sandbox_info: None,
             source_profile: None,
             mcp_servers: Vec::new(),
@@ -3584,6 +3625,7 @@ mod tests {
             default_effort: None,
             socket_path: Some(tmp.path().join("dummy.sock")),
             stored_acp_session_id: None,
+            seed_history_replay: false,
             sandbox_info: None,
             source_profile: None,
             mcp_servers: Vec::new(),
@@ -3711,6 +3753,7 @@ mod tests {
             default_effort: None,
             socket_path: Some(tmp.path().join("dummy.sock")),
             stored_acp_session_id: None,
+            seed_history_replay: false,
             sandbox_info: None,
             source_profile: None,
             mcp_servers: Vec::new(),
@@ -4742,6 +4785,7 @@ mod tests {
                 model: None,
                 effort: None,
                 stored_acp_session_id: None,
+                seed_history_replay: false,
                 sandbox_info: None,
                 source_profile: None,
                 yolo_mode: false,
@@ -4816,6 +4860,7 @@ mod tests {
                 model: None,
                 effort: None,
                 stored_acp_session_id: None,
+                seed_history_replay: false,
                 sandbox_info: None,
                 source_profile: None,
                 yolo_mode: false,
@@ -5028,6 +5073,7 @@ mod tests {
                 model: None,
                 effort: None,
                 stored_acp_session_id: None,
+                seed_history_replay: false,
                 sandbox_info: None,
                 source_profile: None,
                 yolo_mode: false,
@@ -5081,6 +5127,7 @@ mod tests {
                 model: None,
                 effort: None,
                 stored_acp_session_id: None,
+                seed_history_replay: false,
                 sandbox_info: None,
                 source_profile: None,
                 yolo_mode: false,

@@ -292,6 +292,11 @@ pub async fn spawn_acp(
     let model = req.model.or_else(|| instance.agent_model.clone());
     let stored_acp_session_id = instance.acp_session_id.clone();
     let yolo_mode = instance.yolo_mode;
+    // #2276: seed the transcript from the session/load replay when importing
+    // an existing Claude session (import_pending set, empty store). The
+    // supervisor clears any partial replay from a prior attempt after it
+    // reserves the worker slot, so we only pass the flag here.
+    let seed_history_replay = instance.import_pending == Some(true);
 
     let inst_lock = state.instance_lock(&id).await;
     let sandbox_info = match crate::acp::sandbox::ensure_container_for_session(
@@ -334,6 +339,7 @@ pub async fn spawn_acp(
                 &instance.tool,
                 &instance.command,
             ),
+            seed_history_replay,
         })
         .await
     {
@@ -763,6 +769,8 @@ pub async fn switch_acp_agent(
                 &instance.tool,
                 &instance.command,
             ),
+            // Switching ACP backend starts a fresh session, never an import.
+            seed_history_replay: false,
         })
         .await;
     if let Err(e) = spawn_result {
@@ -806,6 +814,10 @@ pub async fn switch_acp_agent(
         if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
             inst.agent_name = Some(target_for_save.clone());
             inst.acp_session_id = None;
+            // Switching backend abandons any pending import (#2276), else a
+            // later spawn/reconciler pass treats this as an import and clears
+            // the store before spawning.
+            inst.import_pending = None;
             if let Some(m) = &model {
                 inst.agent_model = Some(m.clone());
             }
@@ -816,6 +828,7 @@ pub async fn switch_acp_agent(
             if let Some(inst) = instances.iter_mut().find(|i| i.id == id_for_save) {
                 inst.agent_name = Some(target_for_save.clone());
                 inst.acp_session_id = None;
+                inst.import_pending = None;
             }
             Ok(())
         }) {
@@ -1602,6 +1615,9 @@ pub async fn acp_enable(
     let model = instance.agent_model.clone();
     let stored_acp_session_id = instance.acp_session_id.clone();
     let yolo_mode = instance.yolo_mode;
+    // #2276: seed the transcript from the session/load replay when enabling
+    // the structured view on an imported session (import_pending, empty store).
+    let seed_history_replay = instance.import_pending == Some(true);
     let profile_for_spawn = profile.clone();
     let command_override = crate::server::acp_reconciler::command_override_for_spawn(
         &instance.tool,
@@ -1644,6 +1660,7 @@ pub async fn acp_enable(
                 source_profile,
                 yolo_mode,
                 agent_command_override: command_override,
+                seed_history_replay,
             })
             .await
         {
@@ -1727,6 +1744,8 @@ pub async fn acp_disable(
             "clearing acp_session_id on disable"
         );
         instance.acp_session_id = None;
+        // Disabling structured view abandons any pending import (#2276).
+        instance.import_pending = None;
     }
 
     // Persist + start tmux. start() now no longer short-circuits for
@@ -1743,6 +1762,7 @@ pub async fn acp_disable(
         if let Some(slot) = instances.iter_mut().find(|i| i.id == id) {
             slot.view = crate::session::View::Terminal;
             slot.acp_session_id = None;
+            slot.import_pending = None;
         }
     }
     let id_for_save = id.clone();
@@ -1754,6 +1774,7 @@ pub async fn acp_disable(
             if let Some(slot) = all.iter_mut().find(|i| i.id == id_for_save) {
                 slot.view = crate::session::View::Terminal;
                 slot.acp_session_id = None;
+                slot.import_pending = None;
             }
             Ok(())
         })?;
@@ -2109,6 +2130,65 @@ pub async fn acp_replay(
         has_more,
     })
     .into_response()
+}
+
+/// List existing Claude Code sessions on disk, newest first, for the import
+/// picker. Gated behind `read_only_block`: this exposes external Claude session
+/// titles and working directories from outside AoE-managed state, and import
+/// can't run in read-only mode anyway, so read-only dashboard users get no
+/// historical prompt metadata. See #2276.
+pub async fn list_claude_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
+    let mut sessions = tokio::task::spawn_blocking(crate::acp::claude_import::scan_sessions)
+        .await
+        .unwrap_or_default();
+    // Drop sessions AoE owns: importing one is a no-op and they are noise in
+    // the picker. Two signals (instances span all profiles, #2276):
+    //   - id match: a managed session's on-disk id equals the instance's
+    //     acp_session_id (structured) or agent_session_id (terminal resume).
+    //   - cwd match: any session whose cwd is inside an AoE-PROVISIONED dir
+    //     (scratch, a managed worktree, or a workspace). This catches the
+    //     smart-rename one-shot AoE runs in that dir, which has its own id not
+    //     stored anywhere. It deliberately does NOT cover a plain project_path:
+    //     a user running `claude` directly in the same repo as an AoE session
+    //     is a real importable conversation, not AoE's, so it stays in the list
+    //     and is only filtered by id match.
+    let (managed_ids, managed_dirs): (std::collections::HashSet<String>, Vec<PathBuf>) = {
+        let instances = state.instances.read().await;
+        let ids = instances
+            .iter()
+            .flat_map(|i| {
+                i.acp_session_id
+                    .iter()
+                    .chain(i.agent_session_id.iter())
+                    .cloned()
+            })
+            .collect();
+        let dirs = instances
+            .iter()
+            .filter(|i| {
+                i.scratch
+                    || i.worktree_info.as_ref().is_some_and(|w| w.managed_by_aoe)
+                    || i.workspace_info.is_some()
+            })
+            .map(|i| PathBuf::from(&i.project_path))
+            .filter(|p| !p.as_os_str().is_empty())
+            .collect();
+        (ids, dirs)
+    };
+    sessions.retain(|s| {
+        if managed_ids.contains(&s.session_id) {
+            return false;
+        }
+        let cwd = std::path::Path::new(&s.cwd);
+        !managed_dirs.iter().any(|d| cwd.starts_with(d))
+    });
+    // Cap AFTER ownership filtering so a burst of AoE-managed sessions can't
+    // push real imports off the (newest-first) list. See #2276.
+    sessions.truncate(crate::acp::claude_import::MAX_SESSIONS);
+    Json(sessions).into_response()
 }
 
 #[cfg(test)]

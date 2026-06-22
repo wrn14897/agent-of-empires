@@ -1582,7 +1582,8 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/acp/elicitations/{nonce}",
             post(api::resolve_elicitation),
         )
-        .route("/api/acp/agents", get(api::list_acp_agents));
+        .route("/api/acp/agents", get(api::list_acp_agents))
+        .route("/api/claude-sessions", get(api::list_claude_sessions));
 
     app
         // Static assets (Vite build output: assets/, manifest.json, sw.js, icons)
@@ -3781,15 +3782,28 @@ fn apply_acp_session_change(
             // that the client parked waiting for a worker that never returns.
             // See #2237.
             let cleared_stale_dormant = inst.idle_dormant_since.take().is_some();
-            if inst.acp_session_id.as_deref() == Some(new_id.as_str()) {
+            let same_acp_session = inst.acp_session_id.as_deref() == Some(new_id.as_str());
+            // #2276: clear import_pending only when the assigned id matches the
+            // imported one, i.e. the import's session/load actually landed and
+            // its replay is now in the event store. A fallback session/new (or
+            // a stale worker) reports a different id; consuming the marker then
+            // would block a later retry from re-seeding the transcript.
+            let cleared_import_pending = if same_acp_session {
+                inst.import_pending.take().unwrap_or(false)
+            } else {
+                false
+            };
+            if same_acp_session {
                 // Same id (a reattach / session/load reuses it). Only persist
-                // if we actually cleared a stale dormant marker; otherwise the
-                // id is already on disk and there is nothing to rewrite.
-                if cleared_stale_dormant {
+                // if we actually cleared a stale dormant marker or the import
+                // flag; otherwise the id is already on disk and there is
+                // nothing to rewrite.
+                if cleared_stale_dormant || cleared_import_pending {
                     tracing::info!(
                         target: "acp.event_listener",
                         session = %session_id,
-                        "cleared stale idle-dormant marker on worker (re)assign"
+                        cleared_import_pending,
+                        "cleared stale idle-dormant / import marker on worker (re)assign"
                     );
                     return Some(inst.source_profile.clone());
                 }
