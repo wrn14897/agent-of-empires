@@ -1906,7 +1906,11 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader({
   const dotClass = STATUS_DOT_CLASS[group.status === "active" ? "Running" : "Idle"] ?? "bg-status-idle";
   const headerStyle = repoColorStyle(group.color);
   const headerHoverClass = group.color ? "" : "hover:bg-surface-800/50";
-  const sessionCount = group.workspaces.reduce((n, v) => n + v.workspace.sessions.length, 0);
+  // Count live rows only, matching the list rendered below (which drops
+  // workspaces where every session is archived or snoozed via
+  // workspaceIsSunk). Summing raw sessions inflated the badge above the
+  // visible row count. See #2372.
+  const sessionCount = group.workspaces.filter((v) => !workspaceIsSunk(v.workspace)).length;
 
   // The whole header row is the drag activator now (no grip handle), so a
   // drag ends with the pointer over one of the row's controls. Suppress the

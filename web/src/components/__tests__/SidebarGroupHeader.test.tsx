@@ -57,6 +57,19 @@ function workspace(id: string, count: number): Workspace {
   };
 }
 
+// A workspace whose every session is sunk (archived or snoozed) is "sunk"
+// per workspaceIsSunk, drops out of the live row list, and must not count
+// toward the header badge. See #2372.
+function sunkWorkspace(id: string, count: number, kind: "archived" | "snoozed"): Workspace {
+  const ws = workspace(id, count);
+  ws.sessions = ws.sessions.map((s) =>
+    kind === "archived"
+      ? { ...s, archived_at: "2025-01-02T00:00:00Z" }
+      : { ...s, snoozed_until: "2099-01-01T00:00:00Z" },
+  );
+  return ws;
+}
+
 function group(over: Partial<SidebarGroup> = {}): SidebarGroup {
   const workspaces = over.workspaces ?? [{ key: "w1", workspace: workspace("w1", 3) }];
   return {
@@ -103,7 +116,7 @@ function renderHeader(props: Partial<Parameters<typeof SidebarGroupHeader>[0]> =
 afterEach(() => cleanup());
 
 describe("SidebarGroupHeader", () => {
-  it("shows the total session count across the project's workspaces", () => {
+  it("counts live (non-sunk) workspaces, matching the rows rendered below", () => {
     renderHeader({
       group: group({
         workspaces: [
@@ -112,7 +125,34 @@ describe("SidebarGroupHeader", () => {
         ],
       }),
     });
-    expect(screen.getByTestId("sidebar-group-session-count").textContent).toBe("(5)");
+    // Two live workspaces, both shown as rows, so the badge reads (2).
+    expect(screen.getByTestId("sidebar-group-session-count").textContent).toBe("(2)");
+  });
+
+  it("excludes archived and snoozed workspaces from the count (#2372)", () => {
+    renderHeader({
+      group: group({
+        workspaces: [
+          { key: "live", workspace: workspace("live", 1) },
+          { key: "arch", workspace: sunkWorkspace("arch", 1, "archived") },
+          { key: "snoozed", workspace: sunkWorkspace("snoozed", 1, "snoozed") },
+        ],
+      }),
+    });
+    // Only the live workspace is a visible row; sunk ones drop to the footer.
+    expect(screen.getByTestId("sidebar-group-session-count").textContent).toBe("(1)");
+  });
+
+  it("reads (0) when every workspace is sunk", () => {
+    renderHeader({
+      group: group({
+        workspaces: [
+          { key: "arch", workspace: sunkWorkspace("arch", 2, "archived") },
+          { key: "snoozed", workspace: sunkWorkspace("snoozed", 1, "snoozed") },
+        ],
+      }),
+    });
+    expect(screen.getByTestId("sidebar-group-session-count").textContent).toBe("(0)");
   });
 
   it("renders the Folder fallback icon when the project has no remote owner", () => {
