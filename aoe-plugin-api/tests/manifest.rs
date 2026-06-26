@@ -299,11 +299,159 @@ api_version = 2
 [runtime]
 kind = "command"
 command = ["python3", "worker.py"]
+system = true
 "#;
     let m = PluginManifest::from_toml_str(toml).expect("runtime command parses");
     match m.runtime.expect("has runtime") {
-        RuntimeSpec::Command { command } => assert_eq!(command, ["python3", "worker.py"]),
+        RuntimeSpec::Command {
+            command,
+            system,
+            build,
+        } => {
+            assert_eq!(command, ["python3", "worker.py"]);
+            assert!(system);
+            assert!(build.is_empty());
+        }
         other => panic!("expected command runtime, got {other:?}"),
+    }
+}
+
+#[test]
+fn runtime_command_build_steps_parse() {
+    let toml = r#"
+id = "acme.thing"
+name = "Thing"
+version = "0.1.0"
+api_version = 2
+
+[runtime]
+kind = "command"
+command = [".venv/bin/worker"]
+
+[[runtime.build]]
+command = ["python3", "-m", "venv", ".venv"]
+
+[[runtime.build]]
+command = [".venv/bin/pip", "install", "."]
+platforms = ["linux", "macos"]
+"#;
+    let m = PluginManifest::from_toml_str(toml).expect("build steps parse");
+    match m.runtime.expect("has runtime") {
+        RuntimeSpec::Command {
+            command,
+            system,
+            build,
+        } => {
+            assert_eq!(command, [".venv/bin/worker"]);
+            assert!(!system);
+            assert_eq!(build.len(), 2);
+            assert_eq!(build[0].command, ["python3", "-m", "venv", ".venv"]);
+            assert!(build[0].platforms.is_empty());
+            assert_eq!(build[1].command, [".venv/bin/pip", "install", "."]);
+            assert_eq!(build[1].platforms, ["linux", "macos"]);
+        }
+        other => panic!("expected command runtime, got {other:?}"),
+    }
+}
+
+#[test]
+fn build_step_empty_command_and_unknown_platform_rejected() {
+    let toml = r#"
+id = "acme.thing"
+name = "Thing"
+version = "0.1.0"
+api_version = 2
+
+[runtime]
+kind = "command"
+command = [".venv/bin/worker"]
+
+[[runtime.build]]
+command = [""]
+platforms = ["linux", "plan9"]
+"#;
+    let err = PluginManifest::from_toml_str(toml).unwrap_err();
+    let messages = match err {
+        ManifestError::Invalid(m) => m,
+        other => panic!("expected Invalid, got {other:?}"),
+    };
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("runtime.build[0].command")),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("runtime.build[0].platforms") && m.contains("plan9")),
+        "{messages:?}"
+    );
+}
+
+/// The worker entrypoint must be plugin-relative by default; a bare program
+/// name is rejected unless the manifest opts into a PATH dependency with
+/// `system = true`.
+#[test]
+fn bare_worker_program_requires_system_opt_in() {
+    let manifest = |line: &str| {
+        format!(
+            r#"
+id = "acme.thing"
+name = "Thing"
+version = "0.1.0"
+api_version = 2
+
+[runtime]
+kind = "command"
+{line}
+"#
+        )
+    };
+
+    // Bare name, no opt-in: rejected, and the message points at the fix.
+    let err = PluginManifest::from_toml_str(&manifest("command = [\"worker\"]")).unwrap_err();
+    match err {
+        ManifestError::Invalid(messages) => assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("plugin-relative") && m.contains("system = true")),
+            "{messages:?}"
+        ),
+        other => panic!("expected Invalid, got {other:?}"),
+    }
+
+    // Same bare name with the opt-in parses.
+    PluginManifest::from_toml_str(&manifest(
+        "command = [\"uv\", \"run\", \"worker\"]\nsystem = true",
+    ))
+    .expect("system opt-in accepts a bare program name");
+
+    // A plugin-relative path is the default-accepted shape.
+    PluginManifest::from_toml_str(&manifest("command = [\".venv/bin/worker\"]"))
+        .expect("plugin-relative entrypoint accepted without opt-in");
+
+    // An absolute path pins a host path and is rejected in both modes.
+    let abs = if cfg!(windows) {
+        "C:/tools/worker.exe"
+    } else {
+        "/usr/bin/worker"
+    };
+    assert!(matches!(
+        PluginManifest::from_toml_str(&manifest(&format!("command = [\"{abs}\"]"))).unwrap_err(),
+        ManifestError::Invalid(_)
+    ));
+
+    // `system = true` with a path is contradictory and rejected.
+    let err =
+        PluginManifest::from_toml_str(&manifest("command = [\".venv/bin/worker\"]\nsystem = true"))
+            .unwrap_err();
+    match err {
+        ManifestError::Invalid(messages) => assert!(
+            messages.iter().any(|m| m.contains("system = true")),
+            "{messages:?}"
+        ),
+        other => panic!("expected Invalid, got {other:?}"),
     }
 }
 

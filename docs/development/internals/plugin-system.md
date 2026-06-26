@@ -127,6 +127,78 @@ plugin directory) or `release-binary` (a compiled worker shipped as a GitHub
 release asset). Installation resolves and downloads a `release-binary` asset;
 the Tier 1 host (below) launches and supervises both kinds.
 
+A `command` runtime may declare ordered `[[runtime.build]]` steps, run once at
+install and update inside the installed plugin directory before the plugin is
+registered. This is how an interpreted worker sets itself up (create a venv,
+`pip install`, `npm ci`), so it can then launch via a plugin-relative
+`command` that never depends on the daemon's PATH:
+
+```toml
+[runtime]
+kind = "command"
+command = [".venv/bin/aoe-github-worker"]   # plugin-relative: PATH-independent
+
+[[runtime.build]]
+command = ["python3", "-m", "venv", ".venv"]
+
+[[runtime.build]]
+command = [".venv/bin/pip", "install", "."]
+platforms = ["linux", "macos"]              # optional; omitted runs everywhere
+```
+
+Each step's argv resolves through the host's argv resolver (bare name on PATH,
+separator path relative to the plugin dir, absolute rejected), evaluated just
+before the step runs so `.venv/bin/pip` resolves once the prior step created it.
+Build steps are free to name bare PATH programs (`python3`, `node`, `uv`): they
+run in the user's interactive shell where PATH is reliable, which is exactly why
+the worker entrypoint, launched later by the daemon, is not. A step's optional `platforms` (`linux` / `macos` / `windows`)
+restricts it to matching hosts. Builds run with cwd set to the plugin dir, with
+stdin closed and stdout/stderr inherited so the user sees progress.
+
+Why install time and the final dir, not launch or staging: `aoe plugin
+install` runs in the user's interactive shell, where `python3` / `node` / `uv`
+are reliably on PATH; the daemon that later launches the worker is not. And a
+Python venv is not relocatable (console-script shebangs and `pyvenv.cfg` embed
+absolute paths), so the build runs in the final `<plugins_dir>/<id>`, never in
+a staging tree that is then renamed. A failed build aborts the install with no
+trace; a failed update restores the prior version from a backup, and a leftover
+backup from an interrupted update is recovered on the next install/update.
+
+The worker entrypoint (`command`'s `argv[0]`) must be plugin-relative: a path
+containing a separator (`.venv/bin/worker`), resolved inside the install
+directory. The host enforces this at manifest validation, so the
+PATH-independent shape is the default and a bare program name is rejected rather
+than silently resolved against whatever PATH the daemon happens to have. An
+absolute path is rejected in every mode (it pins a host path).
+
+A worker that genuinely depends on a system tool, for example `command = ["uv",
+"run", "worker"]`, opts into that PATH dependency explicitly with `system =
+true`:
+
+```toml
+[runtime]
+kind = "command"
+command = ["uv", "run", "worker"]
+system = true   # argv[0] is a bare PATH program, resolved at launch
+```
+
+`system = true` requires a bare program name (a path is contradictory and
+rejected) and moves resolution to launch time against the daemon's PATH. It is
+the conscious "I accept the daemon must have this tool" choice, not a fallback a
+manifest falls into by naming a program that happens not to be on PATH. Because
+its program is resolved at launch, a `system` worker is also not PATH-checked at
+install (the install shell's PATH is not the daemon's), so it installs even when
+the tool is absent from the install environment.
+
+Two trust notes for build steps. They run as the user, unsandboxed, before any
+capability gate (the same honest D8 model as the worker, just earlier), so a
+plugin with build steps always prompts at install, even when it requests no
+capabilities, and discloses the commands verbatim; `--yes` consents to both.
+And a build that runs `pip install` pulls dependency bytes the source tree hash
+does not attest; a featured plugin should pin them (for example a hash-locked
+`requirements.txt`). First-class dependency and release-binary attestation are
+deferred.
+
 ## Capabilities and grants (#2093)
 
 Static contributions are not capabilities; a theme or a command needs no
@@ -305,11 +377,13 @@ args, cwd, env }`, dispatched off the `[runtime]` kind in a single `match`.
 Adding a new runtime kind later is a new arm there; the supervisor and the
 transport only ever see a `ResolvedLaunch`, so nothing downstream changes.
 
-- `command`: `argv[0]` resolves on `PATH` via `which` when it is a bare name (a
-  console-script entrypoint like `aoe-github-worker`, or an interpreter like
-  `python3`), or relative to the plugin directory when it contains a separator
-  (an in-tree script or binary), verified executable. Absolute and
-  parent-traversal paths are rejected.
+- `command`: `argv[0]` resolves on `PATH` via `which` when it is a bare name (an
+  interpreter or system tool like `python3` / `uv`), or relative to the plugin
+  directory when it contains a separator (an in-tree script or binary, for
+  example a build-produced `.venv/bin/worker`), verified executable. Absolute
+  and parent-traversal paths are rejected. The same policy resolves each
+  `[[runtime.build]]` step at install time; a plugin's own entrypoint should be
+  plugin-relative so the daemon's PATH never decides whether it launches.
 - `release-binary`: the per-platform binary that installation already placed in
   the plugin directory.
 
