@@ -287,16 +287,25 @@ install-time value; the downloaded worker stays pinned separately by the lock's
 `asset_sha256`.
 
 `plugins/featured.toml` is the curated index, compiled into the binary. Each
-entry pins one vetted release per plugin id to its `{source, tree_hash}`: a
-maintainer's attestation that this exact tree was reviewed. When a plugin id
-appears in the index, install and update **refuse** unless the fetched source
-slug (case-insensitive) and tree hash both match the pin, and a release-binary
-manifest is refused outright (its worker bytes are not covered by the tree hash
-yet). A featured-verified install is the one case allowed to claim a reserved
-(`aoe.*` / `agent-of-empires.*`) namespace; a builtin-id collision is always
-rejected. In debug builds `AOE_FEATURED_INDEX_PATH` overrides the embedded index
-for tests; a release binary always uses the compiled-in index, since the curated
-set is a root of trust and must not be redefinable by the environment.
+entry holds a plugin's `source` slug and a `version -> tree_hash` map of vetted
+releases: a maintainer's attestation that each listed tree was reviewed. When a
+plugin id appears in the index, install and update **refuse** if the fetched
+source slug (case-insensitive) does not match, or if the manifest ships a
+release-binary worker (its bytes are not covered by the tree hash yet). The tree
+hash is then checked against the entry's set of vetted hashes: a match is
+featured-verified. An id-in-index install at a hash that is **not** in the set is
+an unvetted version, not a tamper-refuse: it installs as a non-featured plugin
+(community for a GitHub install), so a maintainer can vet a new release by
+appending its hash without un-verifying older ones. The reserved-namespace gate
+is unchanged, so an unvetted version of a reserved-namespace plugin is still
+refused (only a vetted release lifts that gate). A featured-verified install is
+the one case allowed to claim a reserved (`aoe.*` / `agent-of-empires.*`)
+namespace; a builtin-id collision is always rejected. To ship a new release, run
+`aoe plugin hash` against the new tag and add a `"<version>" = "sha256:..."`
+entry inside the entry's `versions` map alongside the existing ones. In debug
+builds `AOE_FEATURED_INDEX_PATH` overrides the embedded
+index for tests; a release binary always uses the compiled-in index, since the
+curated set is a root of trust and must not be redefinable by the environment.
 
 Every surface (CLI `aoe plugin list` / `info`, the TUI plugin manager, the web
 Plugins panel) shows a `ValidationState`: `builtin`, `featured`, `community` (an
@@ -308,8 +317,11 @@ vs `local` is derived from the install source. The lockfile records the tree
 hash and the install-time `trust` as a resolved record, but the load path does
 not depend on them for validation. The recompute is cheap (only ids the index
 names, and a featured plugin ships no release-binary, so its installed tree
-equals its source tree). The manifest-hash grant check still catches a community
-plugin tampered after install.
+equals its source tree) and is done live on every load from the on-disk tree,
+never from a cache: a metadata-keyed cache could be forged to return a stale
+vetted hash for a tampered tree, so the verified decision always re-hashes
+content. The manifest-hash grant check still catches a community plugin tampered
+after install.
 
 `aoe plugin hash <dir>` prints the tree hash for a plugin directory so an author
 can produce the value a maintainer pins. Run it on a clean checkout.
